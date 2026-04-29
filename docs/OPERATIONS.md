@@ -25,6 +25,7 @@ KVHTTP_ADDR=127.0.0.1:8080
 KVHTTP_STORAGE_PATH=./data
 KVHTTP_CORS_ALLOWED_ORIGINS=http://127.0.0.1:5173,http://localhost:5173
 KVHTTP_BOOTSTRAP_API_KEY=<long-local-secret>
+KVHTTP_API_KEY_PEPPER=<long-api-key-pepper>
 KVHTTP_JWT_SECRET=<long-jwt-secret>
 ```
 

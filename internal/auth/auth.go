@@ -24,14 +24,15 @@ type Store interface {
 }
 
 type Authenticator struct {
-	store     Store
-	jwtSecret string
-	issuer    string
-	audience  string
-	ttl       time.Duration
-	max       int
-	mu        sync.Mutex
-	cache     map[string]cacheEntry
+	store        Store
+	jwtSecret    string
+	apiKeyPepper string
+	issuer       string
+	audience     string
+	ttl          time.Duration
+	max          int
+	mu           sync.Mutex
+	cache        map[string]cacheEntry
 }
 
 type cacheEntry struct {
@@ -39,21 +40,26 @@ type cacheEntry struct {
 	expires   time.Time
 }
 
-func New(store Store, jwtSecret, issuer, audience string, ttl time.Duration, max int) *Authenticator {
+func New(store Store, jwtSecret, apiKeyPepper, issuer, audience string, ttl time.Duration, max int) *Authenticator {
+	if apiKeyPepper == "" {
+		apiKeyPepper = jwtSecret
+	}
 	return &Authenticator{
-		store:     store,
-		jwtSecret: jwtSecret,
-		issuer:    issuer,
-		audience:  audience,
-		ttl:       ttl,
-		max:       max,
-		cache:     map[string]cacheEntry{},
+		store:        store,
+		jwtSecret:    jwtSecret,
+		apiKeyPepper: apiKeyPepper,
+		issuer:       issuer,
+		audience:     audience,
+		ttl:          ttl,
+		max:          max,
+		cache:        map[string]cacheEntry{},
 	}
 }
 
-func APIKeyHash(key string) string {
-	sum := sha256.Sum256([]byte(key))
-	return "sha256:" + hex.EncodeToString(sum[:])
+func APIKeyHash(key, pepper string) string {
+	mac := hmac.New(sha256.New, []byte(pepper))
+	mac.Write([]byte(key))
+	return "hmac-sha256:" + hex.EncodeToString(mac.Sum(nil))
 }
 
 func (a *Authenticator) Invalidate() {
@@ -89,7 +95,7 @@ func (a *Authenticator) Authenticate(header string) (model.Principal, error) {
 		if key == "" {
 			return model.Principal{}, ErrUnauthorized
 		}
-		hash := APIKeyHash(key)
+		hash := APIKeyHash(key, a.apiKeyPepper)
 		if p, ok := a.getCache("apikey:" + hash); ok {
 			return p, nil
 		}

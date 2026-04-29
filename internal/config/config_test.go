@@ -25,6 +25,7 @@ func TestLoadFromFileUsesFileAndDefaultsNotEnvironment(t *testing.T) {
 # local config
 export KVHTTP_STORAGE_PATH = "./local data"
 KVHTTP_BOOTSTRAP_API_KEY='file-secret'
+KVHTTP_API_KEY_PEPPER="file-pepper"
 KVHTTP_MAX_TX_OPS=42
 KVHTTP_CORS_ALLOWED_ORIGINS=http://127.0.0.1:5173
 `
@@ -43,6 +44,9 @@ KVHTTP_CORS_ALLOWED_ORIGINS=http://127.0.0.1:5173
 	}
 	if cfg.BootstrapAPIKey != "file-secret" {
 		t.Fatalf("bootstrap key was not read from file")
+	}
+	if cfg.APIKeyPepper != "file-pepper" {
+		t.Fatalf("api key pepper was not read from file")
 	}
 	if cfg.MaxTxOps != 42 {
 		t.Fatalf("max tx ops = %d", cfg.MaxTxOps)

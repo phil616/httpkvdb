@@ -34,11 +34,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("storage_error: %v", err)
 	}
-	if err := store.Bootstrap(cfg.BootstrapUserID, cfg.BootstrapUserspaceID, auth.APIKeyHash(cfg.BootstrapAPIKey)); err != nil {
+	apiKeyPepper := cfg.APIKeyPepper
+	if apiKeyPepper == "" {
+		apiKeyPepper = cfg.JWTSecret
+	}
+	if err := store.Bootstrap(cfg.BootstrapUserID, cfg.BootstrapUserspaceID, auth.APIKeyHash(cfg.BootstrapAPIKey, apiKeyPepper)); err != nil {
 		log.Fatalf("bootstrap_error: %v", err)
 	}
 	serial := &lock.Serializable{}
-	authn := auth.New(store, cfg.JWTSecret, cfg.JWTIssuer, cfg.JWTAudience, time.Duration(cfg.AuthCacheTTLMS)*time.Millisecond, cfg.AuthCacheMaxEntries)
+	authn := auth.New(store, cfg.JWTSecret, apiKeyPepper, cfg.JWTIssuer, cfg.JWTAudience, time.Duration(cfg.AuthCacheTTLMS)*time.Millisecond, cfg.AuthCacheMaxEntries)
 	metrics := &observe.Metrics{}
 	coord := httptx.NewCoordinator(store, serial, cfg.MaxTxOps, time.Duration(cfg.DefaultTxTimeoutMS)*time.Millisecond, time.Duration(cfg.MaxTxTimeoutMS)*time.Millisecond)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

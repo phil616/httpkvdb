@@ -17,12 +17,12 @@ func TestAPIKeyHashAuthAndCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hash := APIKeyHash("secret")
+	hash := APIKeyHash("secret", "pepper")
 	p := model.Principal{UserID: "u1", UserspaceID: "space1"}
 	if err := s.UpsertAPIKeyHash(hash, p); err != nil {
 		t.Fatal(err)
 	}
-	a := New(s, "jwt-secret", "", "", time.Minute, 10)
+	a := New(s, "jwt-secret", "pepper", "", "", time.Minute, 10)
 	got, err := a.Authenticate("ApiKey secret")
 	if err != nil {
 		t.Fatal(err)
@@ -43,7 +43,7 @@ func TestJWTSubjectMapping(t *testing.T) {
 	if err := s.UpsertJWTSubject("sub1", model.Principal{UserID: "u1", UserspaceID: "space1"}); err != nil {
 		t.Fatal(err)
 	}
-	a := New(s, "jwt-secret", "issuer", "aud", time.Minute, 10)
+	a := New(s, "jwt-secret", "pepper", "issuer", "aud", time.Minute, 10)
 	token := signTestJWT(t, "jwt-secret", map[string]any{"sub": "sub1", "iss": "issuer", "aud": "aud", "exp": time.Now().Add(time.Hour).Unix()})
 	got, err := a.Authenticate("Bearer " + token)
 	if err != nil {

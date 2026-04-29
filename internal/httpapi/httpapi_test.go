@@ -34,14 +34,14 @@ func newTestHTTP(t *testing.T, dir string) http.Handler {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpsertAPIKeyHash(auth.APIKeyHash("key-a"), model.Principal{UserID: "a", UserspaceID: "space-a"}); err != nil {
+	if err := s.UpsertAPIKeyHash(auth.APIKeyHash("key-a", "pepper"), model.Principal{UserID: "a", UserspaceID: "space-a"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpsertAPIKeyHash(auth.APIKeyHash("key-b"), model.Principal{UserID: "b", UserspaceID: "space-b"}); err != nil {
+	if err := s.UpsertAPIKeyHash(auth.APIKeyHash("key-b", "pepper"), model.Principal{UserID: "b", UserspaceID: "space-b"}); err != nil {
 		t.Fatal(err)
 	}
 	serial := &lock.Serializable{}
-	authn := auth.New(s, "jwt-secret", "", "", time.Minute, 100)
+	authn := auth.New(s, "jwt-secret", "pepper", "", "", time.Minute, 100)
 	coord := httptx.NewCoordinator(s, serial, cfg.MaxTxOps, time.Second, 10*time.Second)
 	return NewServer(cfg, s, authn, serial, coord, &observe.Metrics{}).Handler()
 }

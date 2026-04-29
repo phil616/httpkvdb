@@ -93,6 +93,7 @@ KVHTTP_AUTH_CACHE_MAX_ENTRIES=10000
 KVHTTP_BOOTSTRAP_USER_ID=admin
 KVHTTP_BOOTSTRAP_USERSPACE_ID=admin_space
 KVHTTP_BOOTSTRAP_API_KEY=replace-with-a-long-random-local-secret
+KVHTTP_API_KEY_PEPPER=replace-with-a-long-random-api-key-pepper
 
 # JWT 校验配置，当前实现使用 HS256
 KVHTTP_JWT_SECRET=replace-with-a-long-random-jwt-secret
@@ -103,6 +104,7 @@ KVHTTP_JWT_AUDIENCE=
 生产环境注意事项：
 
 - 必须替换 `KVHTTP_BOOTSTRAP_API_KEY`，默认值只适合本地开发。
+- 必须替换 `KVHTTP_API_KEY_PEPPER`，APIKey 会用该服务端 secret 派生 HMAC-SHA256 摘要后存储。
 - 必须替换 `KVHTTP_JWT_SECRET`，默认值只适合本地开发。
 - 应把 `KVHTTP_CORS_ALLOWED_ORIGINS` 设置为允许访问后端的前端 Origin。
 - `KVHTTP_STORAGE_PATH` 应指向持久化本地磁盘目录。
@@ -118,6 +120,7 @@ KVHTTP_ADDR=127.0.0.1:8080 \
 KVHTTP_STORAGE_PATH=./data \
 KVHTTP_CORS_ALLOWED_ORIGINS=http://127.0.0.1:5173,http://localhost:5173 \
 KVHTTP_BOOTSTRAP_API_KEY=dev-secret-key \
+KVHTTP_API_KEY_PEPPER=dev-api-key-pepper \
 ./bin/kvhttpd
 ```
 

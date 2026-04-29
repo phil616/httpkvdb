@@ -24,6 +24,7 @@ type Config struct {
 	BootstrapUserID      string
 	BootstrapUserspaceID string
 	BootstrapAPIKey      string
+	APIKeyPepper         string
 	JWTSecret            string
 	JWTIssuer            string
 	JWTAudience          string
@@ -63,6 +64,7 @@ var knownKeys = []string{
 	"KVHTTP_BOOTSTRAP_USER_ID",
 	"KVHTTP_BOOTSTRAP_USERSPACE_ID",
 	"KVHTTP_BOOTSTRAP_API_KEY",
+	"KVHTTP_API_KEY_PEPPER",
 	"KVHTTP_JWT_SECRET",
 	"KVHTTP_JWT_ISSUER",
 	"KVHTTP_JWT_AUDIENCE",
@@ -85,6 +87,7 @@ func fromValues(values map[string]string) Config {
 		BootstrapUserID:      value(values, "KVHTTP_BOOTSTRAP_USER_ID", "admin"),
 		BootstrapUserspaceID: value(values, "KVHTTP_BOOTSTRAP_USERSPACE_ID", "admin_space"),
 		BootstrapAPIKey:      value(values, "KVHTTP_BOOTSTRAP_API_KEY", "dev-secret-key"),
+		APIKeyPepper:         value(values, "KVHTTP_API_KEY_PEPPER", ""),
 		JWTSecret:            value(values, "KVHTTP_JWT_SECRET", "dev-jwt-secret"),
 		JWTIssuer:            value(values, "KVHTTP_JWT_ISSUER", ""),
 		JWTAudience:          value(values, "KVHTTP_JWT_AUDIENCE", ""),

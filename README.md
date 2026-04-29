@@ -65,6 +65,7 @@ When `--config` is provided, the server reads configuration from that file and u
 Important production notes:
 
 - Change `KVHTTP_BOOTSTRAP_API_KEY`; the default is only for local development.
+- Change `KVHTTP_API_KEY_PEPPER`; API keys are stored as HMAC-SHA256 digests using this server-side secret.
 - Change `KVHTTP_JWT_SECRET`; the default is only for local development.
 - Set `KVHTTP_CORS_ALLOWED_ORIGINS` to the exact frontend origins that should be allowed.
 - Use a persistent directory for `KVHTTP_STORAGE_PATH`.
@@ -80,6 +81,7 @@ KVHTTP_ADDR=127.0.0.1:8080 \
 KVHTTP_STORAGE_PATH=./data \
 KVHTTP_CORS_ALLOWED_ORIGINS=http://127.0.0.1:5173,http://localhost:5173 \
 KVHTTP_BOOTSTRAP_API_KEY=dev-secret-key \
+KVHTTP_API_KEY_PEPPER=dev-api-key-pepper \
 ./bin/kvhttpd
 ```
 
