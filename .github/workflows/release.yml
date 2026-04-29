@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Go tests
+        run: go test ./...
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Web build
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web assets
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build release archive
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          target="httpkvdb-${version}-${GOOS}-${GOARCH}"
+          mkdir -p "release/${target}"
+          binary="kvhttpd"
+          if [ "${GOOS}" = "windows" ]; then
+            binary="kvhttpd.exe"
+          fi
+          go build -trimpath -ldflags="-s -w" -o "release/${target}/${binary}" ./cmd/kvhttpd
+          cp README.md README.zh.md "release/${target}/"
+          cp -R docs configs scripts "release/${target}/"
+          mkdir -p "release/${target}/web"
+          cp -R web/dist "release/${target}/web/dist"
+          cp web/README.md web/.env.example "release/${target}/web/"
+          tar -C release -czf "release/${target}.tar.gz" "${target}"
+          sha256sum "release/${target}.tar.gz" > "release/${target}.tar.gz.sha256"
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: httpkvdb-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            release/*.tar.gz
+            release/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/*.tar.gz
+            release-artifacts/*.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
