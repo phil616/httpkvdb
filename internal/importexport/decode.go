@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"io"
+	"math"
 	"time"
 
 	"httpkvdb/internal/model"
@@ -35,14 +36,17 @@ func Decode(data []byte, maxKey int, maxValue int64) ([]model.KVRecord, error) {
 	if binary.Read(r, binary.BigEndian, &created) != nil || binary.Read(r, binary.BigEndian, &count) != nil {
 		return nil, ErrInvalidFormat
 	}
-	records := make([]model.KVRecord, 0, count)
+	if count > maxRecordCount(r.Len()) {
+		return nil, ErrInvalidFormat
+	}
+	records := make([]model.KVRecord, 0)
 	for i := uint64(0); i < count; i++ {
 		var keyLen uint32
-		if binary.Read(r, binary.BigEndian, &keyLen) != nil || int(keyLen) > maxKey {
+		if binary.Read(r, binary.BigEndian, &keyLen) != nil || keyLen == 0 || keyLen > uint32(maxKey) {
 			return nil, ErrInvalidFormat
 		}
-		key := make([]byte, keyLen)
-		if _, err := io.ReadFull(r, key); err != nil {
+		key, err := readBoundedBytes(r, uint64(keyLen), uint64(maxKey))
+		if err != nil {
 			return nil, ErrInvalidFormat
 		}
 		if err := storage.ValidateKey(string(key), maxKey); err != nil {
@@ -52,8 +56,8 @@ func Decode(data []byte, maxKey int, maxValue int64) ([]model.KVRecord, error) {
 		if binary.Read(r, binary.BigEndian, &ctLen) != nil {
 			return nil, ErrInvalidFormat
 		}
-		ct := make([]byte, ctLen)
-		if _, err := io.ReadFull(r, ct); err != nil {
+		ct, err := readBoundedBytes(r, uint64(ctLen), maxContentTypeLen)
+		if err != nil {
 			return nil, ErrInvalidFormat
 		}
 		vt, err := r.ReadByte()
@@ -64,8 +68,8 @@ func Decode(data []byte, maxKey int, maxValue int64) ([]model.KVRecord, error) {
 		if binary.Read(r, binary.BigEndian, &valueLen) != nil || valueLen > uint64(maxValue) {
 			return nil, ErrInvalidFormat
 		}
-		value := make([]byte, valueLen)
-		if _, err := io.ReadFull(r, value); err != nil {
+		value, err := readBoundedBytes(r, valueLen, uint64(maxValue))
+		if err != nil {
 			return nil, ErrInvalidFormat
 		}
 		var rec model.KVRecord
@@ -99,6 +103,29 @@ func Decode(data []byte, maxKey int, maxValue int64) ([]model.KVRecord, error) {
 		return nil, ErrInvalidFormat
 	}
 	return records, nil
+}
+
+const (
+	minEncodedRecordLen = 4 + 1 + 2 + 1 + 8 + 8 + 8 + 8 + 32
+	maxContentTypeLen   = 255
+)
+
+func maxRecordCount(remaining int) uint64 {
+	if remaining <= 0 {
+		return 0
+	}
+	return uint64(remaining / minEncodedRecordLen)
+}
+
+func readBoundedBytes(r *bytes.Reader, length uint64, max uint64) ([]byte, error) {
+	if length > max || length > uint64(r.Len()) || length > uint64(math.MaxInt) {
+		return nil, ErrInvalidFormat
+	}
+	buf := make([]byte, int(length))
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 func valueTypeStringFromByte(v uint8) string {
