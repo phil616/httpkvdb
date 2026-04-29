@@ -23,18 +23,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           lfs: true
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: go
           build-mode: manual
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -45,26 +45,26 @@ jobs:
           go build -trimpath -o /tmp/kvhttpd-codeql ./cmd/kvhttpd
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
 
   analyze-web:
     name: Analyze TypeScript
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           lfs: true
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: javascript-typescript
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version-file: web/package.json
           cache: npm
           cache-dependency-path: web/package-lock.json
 
@@ -75,5 +75,4 @@ jobs:
           npm run build
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
-
+        uses: github/codeql-action/analyze@v4

@@ -4,6 +4,7 @@
 
 权威行为规范见 [docs/SPEC.md](docs/SPEC.md)。
 
+GitHub CI/发布配置见 [docs/GITHUB.md](docs/GITHUB.md)，版本同步规则见 [docs/VERSIONS.md](docs/VERSIONS.md)。
 
 ## 当前实现状态
 
@@ -18,7 +19,7 @@
 
 ## 环境要求
 
-- Go 1.22+
+- Go 1.22+ 源码兼容；首选构建工具链由 `go.mod` 指定为 Go 1.26.2
 - Python 3.11+，用于运行生产风格功能测试脚本
 - `uv`，用于本地运行 Python 测试脚本
 

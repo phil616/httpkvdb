@@ -4,6 +4,8 @@
 
 The authoritative behavior specification is [docs/SPEC.md](docs/SPEC.md).
 
+GitHub CI/release setup is documented in [docs/GITHUB.md](docs/GITHUB.md), and version synchronization rules are documented in [docs/VERSIONS.md](docs/VERSIONS.md).
+
 ## Status
 
 This implementation prioritizes correctness over throughput:
@@ -17,7 +19,7 @@ This implementation prioritizes correctness over throughput:
 
 ## Requirements
 
-- Go 1.22+
+- Go 1.22+ source compatibility; Go 1.26.2 preferred toolchain from `go.mod`
 - Python 3.11+ for production test scripts
 - `uv` for running Python scripts in the local test flow
 
