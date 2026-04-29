@@ -27,17 +27,17 @@ jobs:
         with:
           lfs: true
 
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
-        with:
-          languages: go
-          build-mode: manual
-
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: go
+          build-mode: manual
 
       - name: Build and test Go
         run: |
@@ -56,17 +56,17 @@ jobs:
         with:
           lfs: true
 
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
-        with:
-          languages: javascript-typescript
-
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
           node-version-file: web/package.json
           cache: npm
           cache-dependency-path: web/package-lock.json
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
 
       - name: Build web
         working-directory: web

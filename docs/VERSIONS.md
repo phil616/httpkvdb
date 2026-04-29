@@ -26,6 +26,8 @@ with:
 
 `actions/setup-go@v6` reads the `toolchain` directive when present and falls back to the `go` directive otherwise.
 
+For CodeQL Go analysis, `actions/setup-go` must run before `github/codeql-action/init`. CodeQL installs a Go tracing wrapper during `init`; if `setup-go` runs after `init`, it can overwrite `PATH` and CodeQL may fail with "no source code seen during build."
+
 ## Node.js and npm
 
 Frontend runtime declarations live in `web/package.json`:
@@ -70,4 +72,3 @@ When upgrading versions:
 3. Update `web/package.json` `engines` and `packageManager` if Node/npm changes.
 4. Run `cd web && npm install --package-lock-only && npm run build`.
 5. Keep workflow files reading from `go.mod` and `web/package.json`; do not hard-code Go or Node versions in multiple workflow steps.
-
