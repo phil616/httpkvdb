@@ -1,0 +1,10 @@
+.git
+.gitignore
+.env
+.env.*
+bin/
+data/
+tmp/
+coverage.out
+Dockerfile
+docker-compose.yml

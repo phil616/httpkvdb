@@ -108,6 +108,69 @@ curl -i \
 
 ## Deployment
 
+### Docker Compose Deployment
+
+This repository includes a `Dockerfile` and `docker-compose.yml`. Compose builds the image, publishes port `8080`, and persists the database file in the Docker volume `httpkvdb_data`.
+
+Create a local-only `.env` file first:
+
+```bash
+cat > .env <<'EOF'
+KVHTTP_BOOTSTRAP_API_KEY=replace-with-a-long-random-secret
+KVHTTP_API_KEY_PEPPER=replace-with-a-long-random-api-key-pepper
+KVHTTP_JWT_SECRET=replace-with-a-long-random-jwt-secret
+EOF
+chmod 600 .env
+```
+
+You can generate random secret values with:
+
+```bash
+openssl rand -hex 32
+```
+
+Start the service:
+
+```bash
+docker compose up -d --build
+```
+
+Check the service:
+
+```bash
+docker compose ps
+curl -i http://127.0.0.1:8080/healthz
+curl -i http://127.0.0.1:8080/readyz
+```
+
+Authenticated write and read example:
+
+```bash
+curl -i \
+  -X PUT 'http://127.0.0.1:8080/v1/kv/profile' \
+  -H 'Authorization: ApiKey replace-with-a-long-random-secret' \
+  -H 'Content-Type: application/json' \
+  --data '{"name":"Alice"}'
+
+curl -i \
+  'http://127.0.0.1:8080/v1/kv/profile' \
+  -H 'Authorization: ApiKey replace-with-a-long-random-secret'
+```
+
+Stop the service while keeping data:
+
+```bash
+docker compose down
+```
+
+Remove the service and persistent data:
+
+```bash
+docker compose down -v
+```
+
+Note: `httpkvdb` is a single-node database. Do not mount the same persistent directory into multiple container instances in production, and do not horizontally scale this service with Compose `--scale`.
+
 ### Binary Deployment
 
 1. Build on the target host or in CI:

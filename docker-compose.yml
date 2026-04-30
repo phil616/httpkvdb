@@ -1,0 +1,26 @@
+services:
+  httpkvdb:
+    build: .
+    container_name: httpkvdb
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      KVHTTP_ADDR: "0.0.0.0:8080"
+      KVHTTP_STORAGE_PATH: "/data"
+      KVHTTP_CORS_ALLOWED_ORIGINS: "http://127.0.0.1:5173,http://localhost:5173"
+      KVHTTP_BOOTSTRAP_USER_ID: "admin"
+      KVHTTP_BOOTSTRAP_USERSPACE_ID: "admin_space"
+      KVHTTP_BOOTSTRAP_API_KEY: "${KVHTTP_BOOTSTRAP_API_KEY:?set KVHTTP_BOOTSTRAP_API_KEY}"
+      KVHTTP_API_KEY_PEPPER: "${KVHTTP_API_KEY_PEPPER:?set KVHTTP_API_KEY_PEPPER}"
+      KVHTTP_JWT_SECRET: "${KVHTTP_JWT_SECRET:?set KVHTTP_JWT_SECRET}"
+    volumes:
+      - httpkvdb_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  httpkvdb_data:

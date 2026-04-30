@@ -147,6 +147,69 @@ curl -i \
 
 ## 部署
 
+### Docker Compose 部署
+
+本仓库提供 `Dockerfile` 和 `docker-compose.yml`。Compose 会构建镜像、监听宿主机 `8080` 端口，并把数据库文件持久化到 Docker volume `httpkvdb_data`。
+
+先创建只保存在本机的 `.env` 文件：
+
+```bash
+cat > .env <<'EOF'
+KVHTTP_BOOTSTRAP_API_KEY=replace-with-a-long-random-secret
+KVHTTP_API_KEY_PEPPER=replace-with-a-long-random-api-key-pepper
+KVHTTP_JWT_SECRET=replace-with-a-long-random-jwt-secret
+EOF
+chmod 600 .env
+```
+
+可以用下面的命令生成随机密钥值：
+
+```bash
+openssl rand -hex 32
+```
+
+启动服务：
+
+```bash
+docker compose up -d --build
+```
+
+检查服务状态：
+
+```bash
+docker compose ps
+curl -i http://127.0.0.1:8080/healthz
+curl -i http://127.0.0.1:8080/readyz
+```
+
+写入和读取示例：
+
+```bash
+curl -i \
+  -X PUT 'http://127.0.0.1:8080/v1/kv/profile' \
+  -H 'Authorization: ApiKey replace-with-a-long-random-secret' \
+  -H 'Content-Type: application/json' \
+  --data '{"name":"Alice"}'
+
+curl -i \
+  'http://127.0.0.1:8080/v1/kv/profile' \
+  -H 'Authorization: ApiKey replace-with-a-long-random-secret'
+```
+
+停止服务但保留数据：
+
+```bash
+docker compose down
+```
+
+删除服务和持久化数据：
+
+```bash
+docker compose down -v
+```
+
+注意：`httpkvdb` 是单节点数据库，生产环境不要把同一个持久化目录挂给多个容器实例，也不要用 Compose 的 `--scale` 横向扩容该服务。
+
 ### 二进制部署
 
 1. 在目标机器或 CI 中构建：
