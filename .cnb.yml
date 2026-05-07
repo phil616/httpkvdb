@@ -138,14 +138,16 @@ main:
             script: |
               set -euo pipefail
 
-              mkdir -p /opt/httpkvdb/data
+              sudo mkdir -p /opt/httpkvdb/data
+              sudo chown -R 1000:1000 /opt/httpkvdb/data
+              sudo chmod 700 /opt/httpkvdb/data
 
-              docker login -u ${CNB_TOKEN_USER_NAME} -p "${HTTPKVDB_DEPLOY_TOKEN}" ${CNB_DOCKER_REGISTRY}
-              docker pull "${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:prod"
+              sudo docker login -u ${CNB_TOKEN_USER_NAME} -p "${HTTPKVDB_DEPLOY_TOKEN}" ${CNB_DOCKER_REGISTRY}
+              sudo docker pull "${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:prod"
 
-              docker rm -f httpkvdb || true
+              sudo docker rm -f httpkvdb || true
 
-              docker run -d \
+              sudo docker run -d \
                 --name httpkvdb \
                 --restart unless-stopped \
                 -p 5008:8080 \
@@ -167,13 +169,13 @@ main:
                 -e BUILD_SHA="${CNB_COMMIT}" \
                 "${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:prod"
 
-              if ! timeout 60 sh -c 'until [ "$(docker inspect -f "{{.State.Health.Status}}" httpkvdb 2>/dev/null || true)" = "healthy" ]; do sleep 2; done'; then
-                docker logs --tail 80 httpkvdb || true
+              if ! timeout 60 sh -c 'until [ "$(sudo docker inspect -f "{{.State.Health.Status}}" httpkvdb 2>/dev/null || true)" = "healthy" ]; do sleep 2; done'; then
+                sudo docker logs --tail 80 httpkvdb || true
                 exit 1
               fi
 
-              docker images "${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}" -q | grep -v "$(docker inspect -f '{{.Image}}' httpkvdb | sed 's/^sha256://' || true)" | xargs -r docker rmi -f || true
-              docker image prune -f || true
+              sudo docker images "${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}" -q | grep -v "$(sudo docker inspect -f '{{.Image}}' httpkvdb | sed 's/^sha256://' || true)" | xargs -r sudo docker rmi -f || true
+              sudo docker image prune -f || true
 
         - name: Deploy success notification
           image: cnbcool/webhook
