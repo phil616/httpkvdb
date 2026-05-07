@@ -1,118 +1,24 @@
 # httpkvdb
 
-`httpkvdb` is a single-node strongly consistent KV database exposed over HTTP. It supports per-user userspace isolation, APIKey and JWT authentication, JSON/string/binary values, multi-request transactions, and binary import/export.
+`httpkvdb` 是一个通过 HTTP 暴露的单机强一致 KV 数据库。它支持 userspace 隔离、APIKey/JWT 认证、字符串/JSON/二进制 value、多请求事务，以及二进制导入导出。
 
-The authoritative behavior specification is [docs/SPEC.md](docs/SPEC.md).
+权威行为规范见 [docs/SPEC.md](docs/SPEC.md)。AI 智能体接入说明见 [GUIDE.md](GUIDE.md)。
 
-GitHub CI/release setup is documented in [docs/GITHUB.md](docs/GITHUB.md), and version synchronization rules are documented in [docs/VERSIONS.md](docs/VERSIONS.md).
+## 特性
 
-## Status
+- 单节点强一致，优先正确性，不做分布式扩展。
+- 普通 `PUT` / `GET` / `HEAD` / `DELETE` 是单操作可串行化事务。
+- 普通 CRUD、事务提交、导入、导出都会经过全局串行化锁。
+- 事务片段在 commit 前只持久化，不提前执行。
+- 每个认证身份映射到独立 userspace，客户端不能指定 userspace。
+- APIKey 只保存 HMAC-SHA256 摘要，不保存明文。
+- 日志不得包含 APIKey、JWT、`Authorization` Header 或原始 value。
 
-This implementation prioritizes correctness over throughput:
+## 默认部署：Docker Compose
 
-- Ordinary `PUT` / `GET` / `HEAD` / `DELETE` requests are treated as single-operation serializable transactions.
-- Ordinary CRUD, transaction commit, import, and export all pass through one global serializable lock.
-- Transaction fragments are persisted but not executed until commit.
-- Transaction commit executes operations by `seq` order inside one atomic storage update.
-- API keys are stored as SHA-256 hashes only.
-- Logs must not include API keys, `Authorization` headers, or raw values.
+仓库已提供 `Dockerfile` 和 `docker-compose.yml`。默认推荐使用 Docker Compose 部署；服务监听宿主机 `8080`，数据持久化到 Docker volume `httpkvdb_data`。
 
-## Requirements
-
-- Go 1.22+ source compatibility; Go 1.26.2 preferred toolchain from `go.mod`
-- Python 3.11+ for production test scripts
-- `uv` for running Python scripts in the local test flow
-
-## Build
-
-Run the normal test suite first:
-
-```bash
-go test ./...
-```
-
-Build the server binary:
-
-```bash
-mkdir -p bin
-go build -trimpath -ldflags='-s -w' -o bin/kvhttpd ./cmd/kvhttpd
-```
-
-The resulting binary is:
-
-```text
-bin/kvhttpd
-```
-
-## Configuration
-
-The server can be configured through an env-style config file or environment variables. A complete template is available at [configs/kvhttpd.env.example](configs/kvhttpd.env.example).
-
-For local development:
-
-```bash
-cp configs/kvhttpd.env.example .env.local
-```
-
-Edit `.env.local`, then start with an explicit config file:
-
-```bash
-./bin/kvhttpd --config .env.local
-```
-
-When `--config` is provided, the server reads configuration from that file and uses built-in defaults for missing keys. It does not read process environment variables for missing values. When `--config` is omitted, the server reads environment variables.
-
-Important production notes:
-
-- Change `KVHTTP_BOOTSTRAP_API_KEY`; the default is only for local development.
-- Change `KVHTTP_API_KEY_PEPPER`; API keys are stored as HMAC-SHA256 digests using this server-side secret.
-- Change `KVHTTP_JWT_SECRET`; the default is only for local development.
-- Set `KVHTTP_CORS_ALLOWED_ORIGINS` to the exact frontend origins that should be allowed.
-- Use a persistent directory for `KVHTTP_STORAGE_PATH`.
-- Protect the environment file because it contains secret material.
-- Do not put userspace IDs in client requests; userspace is derived from authentication.
-
-## Start
-
-Development start:
-
-```bash
-KVHTTP_ADDR=127.0.0.1:8080 \
-KVHTTP_STORAGE_PATH=./data \
-KVHTTP_CORS_ALLOWED_ORIGINS=http://127.0.0.1:5173,http://localhost:5173 \
-KVHTTP_BOOTSTRAP_API_KEY=dev-secret-key \
-KVHTTP_API_KEY_PEPPER=dev-api-key-pepper \
-./bin/kvhttpd
-```
-
-Health checks:
-
-```bash
-curl -i http://127.0.0.1:8080/healthz
-curl -i http://127.0.0.1:8080/readyz
-```
-
-Authenticated request example:
-
-```bash
-curl -i \
-  -X PUT 'http://127.0.0.1:8080/v1/kv/profile' \
-  -H 'Authorization: ApiKey dev-secret-key' \
-  -H 'Content-Type: application/json' \
-  --data '{"name":"Alice"}'
-
-curl -i \
-  'http://127.0.0.1:8080/v1/kv/profile' \
-  -H 'Authorization: ApiKey dev-secret-key'
-```
-
-## Deployment
-
-### Docker Compose Deployment
-
-This repository includes a `Dockerfile` and `docker-compose.yml`. Compose builds the image, publishes port `8080`, and persists the database file in the Docker volume `httpkvdb_data`.
-
-Create a local-only `.env` file first:
+先创建本机 `.env`：
 
 ```bash
 cat > .env <<'EOF'
@@ -123,19 +29,19 @@ EOF
 chmod 600 .env
 ```
 
-You can generate random secret values with:
+可用下面命令生成随机密钥：
 
 ```bash
 openssl rand -hex 32
 ```
 
-Start the service:
+启动：
 
 ```bash
 docker compose up -d --build
 ```
 
-Check the service:
+检查：
 
 ```bash
 docker compose ps
@@ -143,7 +49,7 @@ curl -i http://127.0.0.1:8080/healthz
 curl -i http://127.0.0.1:8080/readyz
 ```
 
-Authenticated write and read example:
+写入和读取：
 
 ```bash
 curl -i \
@@ -157,152 +63,97 @@ curl -i \
   -H 'Authorization: ApiKey replace-with-a-long-random-secret'
 ```
 
-Stop the service while keeping data:
+停止但保留数据：
 
 ```bash
 docker compose down
 ```
 
-Remove the service and persistent data:
+删除服务和持久化数据：
 
 ```bash
 docker compose down -v
 ```
 
-Note: `httpkvdb` is a single-node database. Do not mount the same persistent directory into multiple container instances in production, and do not horizontally scale this service with Compose `--scale`.
+注意：`httpkvdb` 是单节点数据库。不要把同一个持久化目录挂给多个容器实例，也不要用 `docker compose --scale` 横向扩容。
 
-### Binary Deployment
+## 关键配置
 
-1. Build on the target host or in CI:
+Docker Compose 默认从 `.env` 读取密钥，并在容器中使用：
 
-   ```bash
-   go test ./...
-   go build -trimpath -ldflags='-s -w' -o bin/kvhttpd ./cmd/kvhttpd
-   ```
-
-2. Install the binary:
-
-   ```bash
-   sudo install -m 0755 bin/kvhttpd /usr/local/bin/kvhttpd
-   ```
-
-3. Create directories:
-
-   ```bash
-   sudo mkdir -p /var/lib/httpkvdb /etc/httpkvdb
-   sudo chmod 700 /var/lib/httpkvdb /etc/httpkvdb
-   ```
-
-4. Install and edit config:
-
-   ```bash
-   sudo cp configs/kvhttpd.env.example /etc/httpkvdb/kvhttpd.env
-   sudo chmod 600 /etc/httpkvdb/kvhttpd.env
-   sudo editor /etc/httpkvdb/kvhttpd.env
-   ```
-
-5. Start manually:
-
-   ```bash
-   /usr/local/bin/kvhttpd --config /etc/httpkvdb/kvhttpd.env
-   ```
-
-### systemd Example
-
-Create `/etc/systemd/system/kvhttpd.service`:
-
-```ini
-[Unit]
-Description=httpkvdb single-node HTTP KV database
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/kvhttpd --config /etc/httpkvdb/kvhttpd.env
-Restart=on-failure
-RestartSec=2s
-User=kvhttpd
-Group=kvhttpd
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ReadWritePaths=/var/lib/httpkvdb
-
-[Install]
-WantedBy=multi-user.target
+```text
+KVHTTP_ADDR=0.0.0.0:8080
+KVHTTP_STORAGE_PATH=/data
+KVHTTP_CORS_ALLOWED_ORIGINS=http://127.0.0.1:5173,http://localhost:5173
+KVHTTP_BOOTSTRAP_USER_ID=admin
+KVHTTP_BOOTSTRAP_USERSPACE_ID=admin_space
+KVHTTP_BOOTSTRAP_API_KEY=<required>
+KVHTTP_API_KEY_PEPPER=<required>
+KVHTTP_JWT_SECRET=<required>
 ```
 
-Example service setup:
+完整配置模板见 [configs/kvhttpd.env.example](configs/kvhttpd.env.example)。
 
-```bash
-sudo useradd --system --home /var/lib/httpkvdb --shell /usr/sbin/nologin kvhttpd
-sudo chown -R kvhttpd:kvhttpd /var/lib/httpkvdb
-sudo systemctl daemon-reload
-sudo systemctl enable --now kvhttpd
-sudo systemctl status kvhttpd
-```
+生产环境至少要做这些事：
 
-## Testing
+- 替换 `KVHTTP_BOOTSTRAP_API_KEY`、`KVHTTP_API_KEY_PEPPER`、`KVHTTP_JWT_SECRET`。
+- 保护 `.env`，不要提交密钥。
+- 按实际前端域名设置 `KVHTTP_CORS_ALLOWED_ORIGINS`。
+- 对外暴露时在前面放置 TLS 和网络访问控制。
 
-### Unit and Integration Tests
+## 本地开发
+
+要求：
+
+- Go 1.22+ 源码兼容；首选工具链见 `go.mod`
+- Node.js/npm 用于 Web 管理端
+- Python 3.11+ 和 `uv` 用于生产风格测试脚本
+
+运行后端测试：
 
 ```bash
 go test ./...
 ```
 
-These tests cover storage persistence, userspace isolation, APIKey/JWT auth mapping, auth cache behavior, transaction ordering, idempotency, rollback, expiration, import/export checksum, and HTTP integration paths.
-
-### Production-Style Functional Test
-
-The production-style test uses the built binary, starts it as a real process, calls HTTP endpoints, restarts the process, and emits a JSON report.
-
-Build first:
+构建后端二进制：
 
 ```bash
+mkdir -p bin
 go build -trimpath -ldflags='-s -w' -o bin/kvhttpd ./cmd/kvhttpd
 ```
 
-Run:
+本地启动后端：
 
 ```bash
-uv run python scripts/production_test.py --binary ./bin/kvhttpd --port 18080
+KVHTTP_ADDR=127.0.0.1:8080 \
+KVHTTP_STORAGE_PATH=./data \
+KVHTTP_CORS_ALLOWED_ORIGINS=http://127.0.0.1:5173,http://localhost:5173 \
+KVHTTP_BOOTSTRAP_API_KEY=dev-secret-key \
+KVHTTP_API_KEY_PEPPER=dev-api-key-pepper \
+KVHTTP_JWT_SECRET=dev-jwt-secret \
+./bin/kvhttpd
 ```
 
-The script verifies:
-
-- health and readiness
-- unauthenticated request rejection
-- JSON KV CRUD and metadata headers
-- invalid JSON rejection
-- binary value round trip
-- transaction fragments are not visible before commit
-- out-of-order transaction fragments execute by `seq`
-- duplicate commit returns the same committed result
-- binary export/import modes
-- metrics endpoint
-- committed data survives process restart
-
-The report intentionally does not print API keys, `Authorization` headers, or raw values.
-
-To keep the temporary data directory for debugging:
+构建 Web 管理端：
 
 ```bash
-uv run python scripts/production_test.py --binary ./bin/kvhttpd --port 18080 --keep-data
+cd web
+npm ci
+npm run build
 ```
 
-## HTTP API Quick Reference
+## HTTP API 快速参考
 
-All authenticated APIs use `/v1`.
+所有认证 API 都使用 `/v1` 前缀。
 
-Authentication:
+认证：
 
 ```http
 Authorization: ApiKey <api_key>
 Authorization: Bearer <jwt>
 ```
 
-KV:
+KV：
 
 ```text
 PUT    /v1/kv/{url-encoded-key}
@@ -311,7 +162,7 @@ HEAD   /v1/kv/{url-encoded-key}
 DELETE /v1/kv/{url-encoded-key}
 ```
 
-Transactions:
+事务：
 
 ```text
 POST /v1/tx
@@ -321,14 +172,14 @@ GET  /v1/tx/{tx_id}/result
 POST /v1/tx/{tx_id}/abort
 ```
 
-Import/export:
+导入导出：
 
 ```text
 GET  /v1/export
 POST /v1/import
 ```
 
-Observability:
+健康检查和指标：
 
 ```text
 GET /healthz
@@ -336,27 +187,29 @@ GET /readyz
 GET /metrics
 ```
 
-## Storage
+## 存储
 
-The current storage backend writes one JSON snapshot file under `KVHTTP_STORAGE_PATH`:
+当前存储后端会在 `KVHTTP_STORAGE_PATH` 下写入一个 JSON 快照文件：
 
 ```text
 <storage-path>/httpkvdb.json
 ```
 
-The file contains logically isolated sections for:
+写入通过临时文件和原子 rename 持久化。生产部署时应使用可靠的本地持久化存储。
 
-- user KV spaces
-- system API key records
-- system JWT subject records
-- transaction state and committed results
+## 测试
 
-Writes are persisted through a temporary file and atomic rename. Keep `KVHTTP_STORAGE_PATH` on durable local storage.
+标准测试：
 
-## Security Checklist
+```bash
+go test ./...
+```
 
-- Replace all default secrets before exposing the service.
-- Restrict permissions on config and storage directories.
-- Put TLS and network access control in front of the service if it is not bound to localhost.
-- Do not log request bodies or `Authorization` headers.
-- Rotate the bootstrap API key after creating real operational credentials when credential management APIs are added.
+生产风格功能测试会启动真实服务进程，通过 HTTP 验证认证、KV CRUD、事务、导入导出、指标和重启持久化：
+
+```bash
+go build -trimpath -ldflags='-s -w' -o bin/kvhttpd ./cmd/kvhttpd
+uv run python scripts/production_test.py --binary ./bin/kvhttpd --port 18080
+```
+
+测试报告不会打印 APIKey、`Authorization` Header 或原始 value。
