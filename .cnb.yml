@@ -1,0 +1,210 @@
+main:
+  pull_request:
+    - name: ci
+      runner:
+        cpus: 2
+        tags: cnb:arch:amd64
+      docker:
+        image: golang:1.26.2-alpine
+      stages:
+        - name: Go tests
+          script: go test ./...
+
+        - name: Web install dependencies
+          image: node:24
+          volumes:
+            - /root/.npm
+          script: |
+            cd web
+            npm ci
+
+        - name: Web build
+          image: node:24
+          volumes:
+            - /root/.npm
+          script: |
+            cd web
+            echo "VITE_API_BASE_URL=${HTTPKVDB_WEB_API_BASE_URL}" > .env.production
+            echo "VITE_COMMIT_SHA=${CNB_COMMIT}" >> .env.production
+            npm run build
+
+  push:
+    - name: test-build-deploy
+      runner:
+        cpus: 2
+        tags: cnb:arch:amd64
+      services:
+        - docker
+      docker:
+        image: golang:1.26.2-alpine
+      imports:
+        - https://cnb.cool/greenshadecapital/dreamreflex/devops-server-secrets/-/blob/main/s2-server.yml
+      stages:
+        - name: Go tests
+          script: go test ./...
+
+        - name: Web install dependencies
+          image: node:24
+          volumes:
+            - /root/.npm
+          script: |
+            cd web
+            npm ci
+
+        - name: Web build
+          image: node:24
+          volumes:
+            - /root/.npm
+          script: |
+            cd web
+            echo "VITE_API_BASE_URL=${HTTPKVDB_WEB_API_BASE_URL}" > .env.production
+            echo "VITE_COMMIT_SHA=${CNB_COMMIT}" >> .env.production
+            npm run build
+
+        - name: Deploy to EdgeOne Pages
+          imports:
+            - https://cnb.cool/greenshadecapital/dreamreflex/assets-secrets/-/blob/main/api-server.yml
+          image: node:24
+          script: npx edgeone pages deploy /workspace/web/dist/ -n httpkvdb -t ${EDGEONE_API_TOKEN}
+
+        - name: Web build success notification
+          image: cnbcool/webhook
+          imports:
+            - https://cnb.cool/greenshadecapital/dreamreflex/assets-secrets/-/blob/main/api-server.yml
+          settings:
+            urls:
+              - https://api.dreamreflex.com/api/email/send-common
+            method: POST
+            content_type: application/json
+            template: |
+              {
+                "title": "httpkvdb 前端构建成功",
+                "content": "仓库{{ CNB_REPO_SLUG }}前端构建并发布成功，URL：{{ CNB_REPO_URL_HTTPS }}",
+                "message_id": "{{ CNB_COMMIT }}-web",
+                "recipients": ["phil616@163.com"]
+              }
+            headers:
+              - "x-api-key=${UPLOAD_API_KEY}"
+            valid_response_codes: [200, 201, 204]
+            skip_verify: false
+            debug: true
+
+        - name: Docker login
+          script: docker login -u ${CNB_TOKEN_USER_NAME} -p "${CNB_TOKEN}" ${CNB_DOCKER_REGISTRY}
+
+        - name: Docker build
+          script: |
+            docker build \
+              -t ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:prod \
+              -t ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:${CNB_COMMIT} \
+              .
+
+        - name: Docker push
+          script: |
+            docker push ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:prod
+            docker push ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:${CNB_COMMIT}
+
+        - name: Backend build success notification
+          image: cnbcool/webhook
+          imports:
+            - https://cnb.cool/greenshadecapital/dreamreflex/assets-secrets/-/blob/main/api-server.yml
+          settings:
+            urls:
+              - https://api.dreamreflex.com/api/email/send-common
+            method: POST
+            content_type: application/json
+            template: |
+              {
+                "title": "httpkvdb 后端构建成功",
+                "content": "仓库{{ CNB_REPO_SLUG }}后端镜像构建并推送成功，URL：{{ CNB_REPO_URL_HTTPS }}",
+                "message_id": "{{ CNB_COMMIT }}-backend",
+                "recipients": ["phil616@163.com"]
+              }
+            headers:
+              - "x-api-key=${UPLOAD_API_KEY}"
+            valid_response_codes: [200, 201, 204]
+            skip_verify: false
+            debug: true
+
+        - name: Deploy to S2
+          image: cnbcool/ssh
+          settings:
+            host:
+              - ${S2_IP}
+            username: ${S2_SSH_USER}
+            key: ${S2_SSH_PVKEY}
+            port: ${S2_SSH_PORT}
+            command_timeout: 5m
+            script: |
+              set -euo pipefail
+
+              repo="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
+              app_name="httpkvdb"
+              data_dir="/opt/httpkvdb/data"
+
+              mkdir -p "${data_dir}"
+
+              docker login -u ${CNB_TOKEN_USER_NAME} -p "${HTTPKVDB_DEPLOY_TOKEN}" ${CNB_DOCKER_REGISTRY}
+              docker pull "${repo}:prod"
+
+              docker rm -f "${app_name}" || true
+
+              docker run -d \
+                --name "${app_name}" \
+                --restart unless-stopped \
+                -p 5008:8080 \
+                -v "${data_dir}:/data" \
+                --health-cmd='wget -qO- http://127.0.0.1:8080/readyz >/dev/null || exit 1' \
+                --health-interval=10s \
+                --health-timeout=3s \
+                --health-retries=5 \
+                -e KVHTTP_ADDR="0.0.0.0:8080" \
+                -e KVHTTP_STORAGE_PATH="/data" \
+                -e KVHTTP_CORS_ALLOWED_ORIGINS="${HTTPKVDB_CORS_ALLOWED_ORIGINS}" \
+                -e KVHTTP_BOOTSTRAP_USER_ID="${HTTPKVDB_BOOTSTRAP_USER_ID}" \
+                -e KVHTTP_BOOTSTRAP_USERSPACE_ID="${HTTPKVDB_BOOTSTRAP_USERSPACE_ID}" \
+                -e KVHTTP_BOOTSTRAP_API_KEY="${HTTPKVDB_BOOTSTRAP_API_KEY}" \
+                -e KVHTTP_API_KEY_PEPPER="${HTTPKVDB_API_KEY_PEPPER}" \
+                -e KVHTTP_JWT_SECRET="${HTTPKVDB_JWT_SECRET}" \
+                -e KVHTTP_JWT_ISSUER="${HTTPKVDB_JWT_ISSUER:-}" \
+                -e KVHTTP_JWT_AUDIENCE="${HTTPKVDB_JWT_AUDIENCE:-}" \
+                -e BUILD_SHA="${CNB_COMMIT}" \
+                "${repo}:prod"
+
+              for i in $(seq 1 30); do
+                health_status="$(docker inspect -f '{{.State.Health.Status}}' "${app_name}" || true)"
+                if [ "${health_status}" = "healthy" ]; then
+                  break
+                fi
+                if [ "$i" = "30" ]; then
+                  docker logs --tail 80 "${app_name}" || true
+                  exit 1
+                fi
+                sleep 2
+              done
+
+              running_img_id="$(docker inspect -f '{{.Image}}' "${app_name}" || true)"
+              docker images "${repo}" -q | grep -v "${running_img_id#sha256:}" | xargs -r docker rmi -f || true
+              docker image prune -f || true
+
+        - name: Deploy success notification
+          image: cnbcool/webhook
+          imports:
+            - https://cnb.cool/greenshadecapital/dreamreflex/assets-secrets/-/blob/main/api-server.yml
+          settings:
+            urls:
+              - https://api.dreamreflex.com/api/email/send-common
+            method: POST
+            content_type: application/json
+            template: |
+              {
+                "title": "httpkvdb 部署成功",
+                "content": "仓库{{ CNB_REPO_SLUG }}部署成功，URL：{{ CNB_REPO_URL_HTTPS }}",
+                "message_id": "{{ CNB_COMMIT }}",
+                "recipients": ["phil616@163.com"]
+              }
+            headers:
+              - "x-api-key=${UPLOAD_API_KEY}"
+            valid_response_codes: [200, 201, 204]
+            skip_verify: false
+            debug: true
