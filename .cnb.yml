@@ -138,22 +138,18 @@ main:
             script: |
               set -euo pipefail
 
-              repo="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
-              app_name="httpkvdb"
-              data_dir="/opt/httpkvdb/data"
-
-              mkdir -p "${data_dir}"
+              mkdir -p /opt/httpkvdb/data
 
               docker login -u ${CNB_TOKEN_USER_NAME} -p "${HTTPKVDB_DEPLOY_TOKEN}" ${CNB_DOCKER_REGISTRY}
-              docker pull "${repo}:prod"
+              docker pull "${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:prod"
 
-              docker rm -f "${app_name}" || true
+              docker rm -f httpkvdb || true
 
               docker run -d \
-                --name "${app_name}" \
+                --name httpkvdb \
                 --restart unless-stopped \
                 -p 5008:8080 \
-                -v "${data_dir}:/data" \
+                -v /opt/httpkvdb/data:/data \
                 --health-cmd='wget -qO- http://127.0.0.1:8080/readyz >/dev/null || exit 1' \
                 --health-interval=10s \
                 --health-timeout=3s \
@@ -169,22 +165,14 @@ main:
                 -e KVHTTP_JWT_ISSUER="${HTTPKVDB_JWT_ISSUER:-}" \
                 -e KVHTTP_JWT_AUDIENCE="${HTTPKVDB_JWT_AUDIENCE:-}" \
                 -e BUILD_SHA="${CNB_COMMIT}" \
-                "${repo}:prod"
+                "${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:prod"
 
-              for i in $(seq 1 30); do
-                health_status="$(docker inspect -f '{{.State.Health.Status}}' "${app_name}" || true)"
-                if [ "${health_status}" = "healthy" ]; then
-                  break
-                fi
-                if [ "$i" = "30" ]; then
-                  docker logs --tail 80 "${app_name}" || true
-                  exit 1
-                fi
-                sleep 2
-              done
+              if ! timeout 60 sh -c 'until [ "$(docker inspect -f "{{.State.Health.Status}}" httpkvdb 2>/dev/null || true)" = "healthy" ]; do sleep 2; done'; then
+                docker logs --tail 80 httpkvdb || true
+                exit 1
+              fi
 
-              running_img_id="$(docker inspect -f '{{.Image}}' "${app_name}" || true)"
-              docker images "${repo}" -q | grep -v "${running_img_id#sha256:}" | xargs -r docker rmi -f || true
+              docker images "${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}" -q | grep -v "$(docker inspect -f '{{.Image}}' httpkvdb | sed 's/^sha256://' || true)" | xargs -r docker rmi -f || true
               docker image prune -f || true
 
         - name: Deploy success notification
