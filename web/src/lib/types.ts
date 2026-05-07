@@ -4,6 +4,7 @@ export interface SessionState {
   apiBaseUrl: string;
   authMode: AuthMode;
   credential: string;
+  rememberCredential: boolean;
 }
 
 export interface ApiErrorPayload {
@@ -73,4 +74,3 @@ export interface TxDraftOp {
   contentType: string;
   body: string;
 }
-

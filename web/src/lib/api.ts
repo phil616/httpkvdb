@@ -1,13 +1,60 @@
 import { ApiError, ImportResult, KvMetadata, SessionState, TxResult, TxStatus } from "./types";
 
 const defaultApiBaseUrl = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8080";
+const sessionStorageKey = "httpkvdb.console.session";
 
 export function initialSession(): SessionState {
-  return {
+  const fallback: SessionState = {
     apiBaseUrl: defaultApiBaseUrl.replace(/\/$/, ""),
     authMode: "ApiKey",
-    credential: ""
+    credential: "",
+    rememberCredential: false
   };
+  try {
+    const raw = window.localStorage.getItem(sessionStorageKey);
+    if (!raw) {
+      return fallback;
+    }
+    const stored = JSON.parse(raw) as Partial<SessionState>;
+    if (!stored.apiBaseUrl || !stored.authMode || !stored.credential) {
+      return fallback;
+    }
+    return {
+      apiBaseUrl: stored.apiBaseUrl.replace(/\/$/, ""),
+      authMode: stored.authMode,
+      credential: stored.credential,
+      rememberCredential: true
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+export function persistSession(session: SessionState): void {
+  try {
+    if (!session.rememberCredential || !session.credential.trim()) {
+      window.localStorage.removeItem(sessionStorageKey);
+      return;
+    }
+    window.localStorage.setItem(
+      sessionStorageKey,
+      JSON.stringify({
+        apiBaseUrl: session.apiBaseUrl.replace(/\/$/, ""),
+        authMode: session.authMode,
+        credential: session.credential
+      })
+    );
+  } catch {
+    // Browser storage can be disabled; the in-memory session still works.
+  }
+}
+
+export function clearPersistedSession(): void {
+  try {
+    window.localStorage.removeItem(sessionStorageKey);
+  } catch {
+    // Browser storage can be disabled; clearing the in-memory session is enough.
+  }
 }
 
 export class ApiClient {
@@ -161,4 +208,3 @@ export function downloadBlob(blob: Blob, filename: string): void {
   link.click();
   URL.revokeObjectURL(url);
 }
-

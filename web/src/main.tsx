@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import ReactDOM from "react-dom/client";
 import {
   Activity,
@@ -15,7 +15,7 @@ import {
   ShieldCheck,
   Trash2
 } from "lucide-react";
-import { ApiClient, decodeText, downloadBlob, initialSession } from "./lib/api";
+import { ApiClient, clearPersistedSession, decodeText, downloadBlob, initialSession, persistSession } from "./lib/api";
 import { ApiError, ImportResult, KvMetadata, SessionState, TxDraftOp, TxResult, TxStatus } from "./lib/types";
 import "./styles.css";
 
@@ -32,14 +32,17 @@ function App() {
   const authenticated = Boolean(session.credential.trim());
 
   function handleSession(next: SessionState) {
+    const normalized = { ...next, apiBaseUrl: next.apiBaseUrl.replace(/\/$/, "") };
     setError("");
-    setNotice("会话已更新");
-    setSession(next);
+    setNotice(normalized.rememberCredential && normalized.credential.trim() ? "会话已更新，凭据已保存" : "会话已更新");
+    persistSession(normalized);
+    setSession(normalized);
   }
 
   function resetCredential() {
-    setSession((current) => ({ ...current, credential: "" }));
-    setNotice("认证凭据已从当前页面状态清除");
+    clearPersistedSession();
+    setSession((current) => ({ ...current, credential: "", rememberCredential: false }));
+    setNotice("认证凭据已从当前页面和本地存储清除");
   }
 
   return (
@@ -63,6 +66,8 @@ function App() {
           <strong>{session.apiBaseUrl}</strong>
           <span>认证</span>
           <strong>{authenticated ? session.authMode : "未配置"}</strong>
+          <span>本地凭据</span>
+          <strong>{session.rememberCredential && authenticated ? "已保存" : "未保存"}</strong>
           <button className="ghost-button" onClick={resetCredential}>
             <LogOut size={16} /> 清除凭据
           </button>
@@ -117,12 +122,16 @@ function NavButton({ icon, label, active, onClick }: { icon: React.ReactNode; la
 function SessionPanel({ session, onChange }: { session: SessionState; onChange: (session: SessionState) => void }) {
   const [draft, setDraft] = useState(session);
 
+  useEffect(() => {
+    setDraft(session);
+  }, [session]);
+
   return (
     <form
       className="session-panel"
       onSubmit={(event) => {
         event.preventDefault();
-        onChange({ ...draft, apiBaseUrl: draft.apiBaseUrl.replace(/\/$/, "") });
+        onChange(draft);
       }}
     >
       <label>
@@ -139,6 +148,16 @@ function SessionPanel({ session, onChange }: { session: SessionState; onChange: 
       <label>
         <span>凭据</span>
         <input type="password" value={draft.credential} onChange={(event) => setDraft({ ...draft, credential: event.target.value })} autoComplete="off" />
+      </label>
+      <label className="checkbox-label">
+        <input
+          type="checkbox"
+          checked={draft.rememberCredential}
+          onChange={(event) => setDraft({ ...draft, rememberCredential: event.target.checked })}
+        />
+        <span>
+          <Lock size={15} /> 保存凭据
+        </span>
       </label>
       <button className="primary-button" type="submit">
         <ShieldCheck size={16} /> 应用
@@ -536,4 +555,3 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
     <App />
   </React.StrictMode>
 );
-

@@ -171,7 +171,7 @@ h3 {
 
 .session-panel {
   display: grid;
-  grid-template-columns: minmax(160px, 1.4fr) 130px minmax(160px, 1fr) auto;
+  grid-template-columns: minmax(160px, 1.4fr) 130px minmax(160px, 1fr) auto auto;
   gap: 10px;
   align-items: end;
   padding: 14px;
@@ -190,6 +190,43 @@ label span {
   font-size: 12px;
   font-weight: 700;
   color: #4d5b6d;
+}
+
+.checkbox-label {
+  min-height: 38px;
+  align-content: end;
+  cursor: pointer;
+}
+
+.checkbox-label input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.checkbox-label span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 38px;
+  padding: 8px 11px;
+  color: #203044;
+  background: #f4f7fa;
+  border: 1px solid #cfd8e3;
+  border-radius: 7px;
+  white-space: nowrap;
+}
+
+.checkbox-label input:checked + span {
+  color: #174c35;
+  background: #e9f6ef;
+  border-color: #8cc9a8;
+}
+
+.checkbox-label input:focus-visible + span {
+  border-color: #2f6f7e;
+  box-shadow: 0 0 0 3px rgba(47, 111, 126, 0.16);
 }
 
 input,
@@ -470,4 +507,3 @@ textarea:disabled {
     text-align: left;
   }
 }
-
