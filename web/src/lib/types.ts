@@ -66,6 +66,29 @@ export interface ImportResult {
   replaced: number;
 }
 
+export interface CreatedUserspace {
+  user_id: string;
+  userspace_id: string;
+  api_key: string;
+}
+
+export interface UserspaceInfo {
+  userspace_id: string;
+  user_id: string;
+  key_count: number;
+  api_key_count: number;
+}
+
+export interface AdminKeyInfo {
+  userspace_id: string;
+  key: string;
+  content_type: string;
+  value_type: string;
+  version: number;
+  updated_at: string;
+  checksum: string;
+}
+
 export interface TxDraftOp {
   seq: number;
   op: "GET" | "PUT" | "DELETE" | "EXISTS" | "HEAD";

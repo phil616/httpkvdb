@@ -1,12 +1,15 @@
 package storage
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,8 +17,9 @@ import (
 )
 
 var (
-	ErrNotFound   = errors.New("not found")
-	ErrTxNotFound = errors.New("tx not found")
+	ErrNotFound      = errors.New("not found")
+	ErrTxNotFound    = errors.New("tx not found")
+	ErrAlreadyExists = errors.New("already exists")
 )
 
 type APIKeyRecord struct {
@@ -28,6 +32,13 @@ type JWTSubjectRecord struct {
 	Subject   string          `json:"subject"`
 	Principal model.Principal `json:"principal"`
 	Active    bool            `json:"active"`
+}
+
+type UserspaceInfo struct {
+	UserspaceID string `json:"userspace_id"`
+	UserID      string `json:"user_id"`
+	KeyCount    int    `json:"key_count"`
+	APIKeyCount int    `json:"api_key_count"`
 }
 
 type snapshot struct {
@@ -44,6 +55,8 @@ type Store struct {
 	data snapshot
 }
 
+var safeFileSegmentPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
 func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return nil, err
@@ -58,7 +71,12 @@ func Open(path string) (*Store, error) {
 func (s *Store) Bootstrap(userID, userspaceID, apiKeyHash string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	ensureMaps(&s.data)
 	changed := false
+	if s.data.Userspaces[userspaceID] == nil {
+		s.data.Userspaces[userspaceID] = map[string]model.KVRecord{}
+		changed = true
+	}
 	if apiKeyHash != "" {
 		if _, ok := s.data.APIKeys[apiKeyHash]; !ok {
 			p := model.Principal{UserID: userID, UserspaceID: userspaceID, Roles: []string{"admin"}, AuthMethod: "apikey"}
@@ -83,6 +101,142 @@ func (s *Store) UpsertAPIKeyHash(hash string, p model.Principal) error {
 	p.AuthMethod = "apikey"
 	s.data.APIKeys[hash] = APIKeyRecord{Hash: hash, Principal: p, Active: true}
 	return s.persistLocked()
+}
+
+func (s *Store) CreateUserspace(userspaceID, userID, apiKeyHash string) error {
+	if err := ValidateUserspaceID(userspaceID); err != nil {
+		return err
+	}
+	if userID == "" {
+		userID = userspaceID
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ensureMaps(&s.data)
+	if userspaceExistsLocked(&s.data, userspaceID) {
+		return ErrAlreadyExists
+	}
+	s.data.Userspaces[userspaceID] = map[string]model.KVRecord{}
+	if apiKeyHash != "" {
+		p := model.Principal{UserID: userID, UserspaceID: userspaceID, Roles: []string{"user"}, AuthMethod: "apikey"}
+		s.data.APIKeys[apiKeyHash] = APIKeyRecord{Hash: apiKeyHash, Principal: p, Active: true}
+	}
+	return s.persistLocked()
+}
+
+func (s *Store) ListUserspaces() ([]UserspaceInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ensureMaps(&s.data)
+	infos := map[string]UserspaceInfo{}
+	for userspaceID, records := range s.data.Userspaces {
+		infos[userspaceID] = UserspaceInfo{UserspaceID: userspaceID, UserID: userspaceID, KeyCount: len(records)}
+	}
+	for _, rec := range s.data.APIKeys {
+		if !rec.Active {
+			continue
+		}
+		info := infos[rec.Principal.UserspaceID]
+		if info.UserspaceID == "" {
+			info.UserspaceID = rec.Principal.UserspaceID
+			info.KeyCount = len(s.data.Userspaces[rec.Principal.UserspaceID])
+		}
+		if info.UserID == "" || info.UserID == info.UserspaceID {
+			info.UserID = rec.Principal.UserID
+		}
+		info.APIKeyCount++
+		infos[info.UserspaceID] = info
+	}
+	out := make([]UserspaceInfo, 0, len(infos))
+	for _, info := range infos {
+		out = append(out, info)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].UserspaceID < out[j].UserspaceID })
+	return out, nil
+}
+
+func (s *Store) DeleteUserspace(userspaceID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ensureMaps(&s.data)
+	if !userspaceExistsLocked(&s.data, userspaceID) {
+		return ErrNotFound
+	}
+	delete(s.data.Userspaces, userspaceID)
+	for hash, rec := range s.data.APIKeys {
+		if rec.Principal.UserspaceID == userspaceID {
+			delete(s.data.APIKeys, hash)
+		}
+	}
+	for subject, rec := range s.data.JWTSubjects {
+		if rec.Principal.UserspaceID == userspaceID {
+			delete(s.data.JWTSubjects, subject)
+		}
+	}
+	for txID, tx := range s.data.Txs {
+		if tx.UserspaceID == userspaceID {
+			delete(s.data.Txs, txID)
+		}
+	}
+	return s.persistLocked()
+}
+
+func (s *Store) ReplaceUserspaceAPIKeyHash(userspaceID, apiKeyHash string) (model.Principal, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ensureMaps(&s.data)
+	if !userspaceExistsLocked(&s.data, userspaceID) {
+		return model.Principal{}, ErrNotFound
+	}
+	if s.data.Userspaces[userspaceID] == nil {
+		s.data.Userspaces[userspaceID] = map[string]model.KVRecord{}
+	}
+	userID := userspaceID
+	for hash, rec := range s.data.APIKeys {
+		if rec.Principal.UserspaceID == userspaceID {
+			if rec.Principal.UserID != "" {
+				userID = rec.Principal.UserID
+			}
+			delete(s.data.APIKeys, hash)
+		}
+	}
+	p := model.Principal{UserID: userID, UserspaceID: userspaceID, Roles: []string{"user"}, AuthMethod: "apikey"}
+	s.data.APIKeys[apiKeyHash] = APIKeyRecord{Hash: apiKeyHash, Principal: p, Active: true}
+	return p, s.persistLocked()
+}
+
+func (s *Store) ListUserspaceKeys(userspaceID string) ([]model.KVRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	space, ok := s.data.Userspaces[userspaceID]
+	if !ok && !userspaceExistsLocked(&s.data, userspaceID) {
+		return nil, ErrNotFound
+	}
+	records := make([]model.KVRecord, 0, len(space))
+	for _, rec := range space {
+		cp := cloneRecord(rec)
+		cp.Value = nil
+		records = append(records, cp)
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].Key < records[j].Key })
+	return records, nil
+}
+
+func userspaceExistsLocked(d *snapshot, userspaceID string) bool {
+	if _, ok := d.Userspaces[userspaceID]; ok {
+		return true
+	}
+	for _, rec := range d.APIKeys {
+		if rec.Principal.UserspaceID == userspaceID {
+			return true
+		}
+	}
+	for _, rec := range d.JWTSubjects {
+		if rec.Principal.UserspaceID == userspaceID {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) UpsertJWTSubject(subject string, p model.Principal) error {
@@ -328,7 +482,59 @@ func (s *Store) persistLocked() error {
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if err := os.Rename(tmp, s.path); err != nil {
+		return err
+	}
+	return s.syncUserspaceFilesLocked()
+}
+
+func (s *Store) syncUserspaceFilesLocked() error {
+	root := filepath.Join(filepath.Dir(s.path), "userspaces")
+	if err := os.RemoveAll(root); err != nil {
+		return err
+	}
+	for userspaceID, records := range s.data.Userspaces {
+		dir := filepath.Join(root, safeUserspaceDir(userspaceID))
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+		for key, rec := range records {
+			name := valueFileName(key, rec.ContentType)
+			if err := os.WriteFile(filepath.Join(dir, name), rec.Value, 0o600); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func safeUserspaceDir(userspaceID string) string {
+	if ValidateUserspaceID(userspaceID) == nil {
+		return userspaceID
+	}
+	return "u_" + base64.RawURLEncoding.EncodeToString([]byte(userspaceID))
+}
+
+func valueFileName(key, contentType string) string {
+	name := key
+	if key == "." || key == ".." || !safeFileSegmentPattern.MatchString(key) {
+		name = "k_" + base64.RawURLEncoding.EncodeToString([]byte(key))
+	}
+	return name + valueFileExtension(contentType)
+}
+
+func valueFileExtension(contentType string) string {
+	ct := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	switch ct {
+	case "text/plain":
+		return ".txt"
+	case "application/json":
+		return ".json"
+	case "application/octet-stream":
+		return ".bin"
+	default:
+		return ""
+	}
 }
 
 func ensureMaps(d *snapshot) {

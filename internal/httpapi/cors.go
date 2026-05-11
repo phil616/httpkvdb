@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-const corsAllowedHeaders = "Authorization, Content-Type, Accept, X-Request-Id, X-KV-Op, X-KV-Key, X-KV-Op-Id, X-KV-Import-Mode"
+const corsAllowedHeaders = "Authorization, APIKey, X-API-Key, Content-Type, Accept, X-Request-Id, X-KV-Op, X-KV-Key, X-KV-Op-Id, X-KV-Import-Mode"
 const corsExposedHeaders = "X-Request-Id, X-KV-Version, X-KV-Size, X-KV-Checksum, Content-Disposition"
 const corsAllowedMethods = "GET, HEAD, POST, PUT, DELETE, OPTIONS"
 

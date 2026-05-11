@@ -10,7 +10,7 @@
 - 普通 `PUT` / `GET` / `HEAD` / `DELETE` 是单操作可串行化事务。
 - 普通 CRUD、事务提交、导入、导出都会经过全局串行化锁。
 - 事务片段在 commit 前只持久化，不提前执行。
-- 每个认证身份映射到独立 userspace，客户端不能指定 userspace。
+- 每个认证身份映射到独立 userspace；`/api/v1/{userspace}/{key}` 会校验 URL userspace 与认证结果一致。
 - APIKey 只保存 HMAC-SHA256 摘要，不保存明文。
 - 日志不得包含 APIKey、JWT、`Authorization` Header 或原始 value。
 
@@ -53,14 +53,24 @@ curl -i http://127.0.0.1:8080/readyz
 
 ```bash
 curl -i \
-  -X PUT 'http://127.0.0.1:8080/v1/kv/profile' \
-  -H 'Authorization: ApiKey replace-with-a-long-random-secret' \
+  -X PUT 'http://127.0.0.1:8080/api/v1/admin_space/profile' \
+  -H 'APIKey: replace-with-a-long-random-secret' \
   -H 'Content-Type: application/json' \
   --data '{"name":"Alice"}'
 
 curl -i \
-  'http://127.0.0.1:8080/v1/kv/profile' \
-  -H 'Authorization: ApiKey replace-with-a-long-random-secret'
+  'http://127.0.0.1:8080/api/v1/admin_space/profile' \
+  -H 'APIKey: replace-with-a-long-random-secret'
+```
+
+创建新 userspace 需要管理员凭据，响应中的 `api_key` 只返回这一次：
+
+```bash
+curl -i \
+  -X POST 'http://127.0.0.1:8080/v1/admin/userspaces' \
+  -H 'APIKey: replace-with-a-long-random-secret' \
+  -H 'Content-Type: application/json' \
+  --data '{"userspace_id":"alice","user_id":"alice"}'
 ```
 
 停止但保留数据：
@@ -151,6 +161,8 @@ npm run build
 ```http
 Authorization: ApiKey <api_key>
 Authorization: Bearer <jwt>
+APIKey: <api_key>
+X-API-Key: <api_key>
 ```
 
 KV：
@@ -160,6 +172,25 @@ PUT    /v1/kv/{url-encoded-key}
 GET    /v1/kv/{url-encoded-key}
 HEAD   /v1/kv/{url-encoded-key}
 DELETE /v1/kv/{url-encoded-key}
+
+PUT    /api/v1/{userspace}/{url-encoded-key}
+GET    /api/v1/{userspace}/{url-encoded-key}
+HEAD   /api/v1/{userspace}/{url-encoded-key}
+DELETE /api/v1/{userspace}/{url-encoded-key}
+```
+
+管理：
+
+```text
+POST /v1/admin/userspaces
+GET    /v1/admin/userspaces
+DELETE /v1/admin/userspaces/{userspace}
+POST   /v1/admin/userspaces/{userspace}/api-key
+GET    /v1/admin/userspaces/{userspace}/keys
+PUT    /v1/admin/userspaces/{userspace}/kv/{key}
+GET    /v1/admin/userspaces/{userspace}/kv/{key}
+HEAD   /v1/admin/userspaces/{userspace}/kv/{key}
+DELETE /v1/admin/userspaces/{userspace}/kv/{key}
 ```
 
 事务：
@@ -189,13 +220,17 @@ GET /metrics
 
 ## 存储
 
-当前存储后端会在 `KVHTTP_STORAGE_PATH` 下写入一个 JSON 快照文件：
+当前存储后端会在 `KVHTTP_STORAGE_PATH` 下写入一个 JSON 快照文件，并同步生成按 userspace 分组的 KV 文件镜像：
 
 ```text
 <storage-path>/httpkvdb.json
+<storage-path>/userspaces/{userspace}/{key}.txt
+<storage-path>/userspaces/{userspace}/{key}.json
+<storage-path>/userspaces/{userspace}/{key}.bin
+<storage-path>/userspaces/{userspace}/{key}
 ```
 
-写入通过临时文件和原子 rename 持久化。生产部署时应使用可靠的本地持久化存储。
+文件后缀由 `Content-Type` 决定：`text/plain` 为 `.txt`，`application/json` 为 `.json`，`application/octet-stream` 为 `.bin`，其他类型无后缀。复杂 key 会被安全编码后落盘，不会直接作为路径使用。写入通过临时文件和原子 rename 持久化。生产部署时应使用可靠的本地持久化存储。
 
 ## 测试
 
@@ -212,4 +247,4 @@ go build -trimpath -ldflags='-s -w' -o bin/kvhttpd ./cmd/kvhttpd
 uv run python scripts/production_test.py --binary ./bin/kvhttpd --port 18080
 ```
 
-测试报告不会打印 APIKey、`Authorization` Header 或原始 value。
+测试还会验证 `/api/v1/{userspace}/{key}`、`APIKey` Header、管理员创建 userspace 以及 userspace 文件镜像。测试报告不会打印 APIKey、`Authorization` Header 或原始 value。

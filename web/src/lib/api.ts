@@ -1,4 +1,4 @@
-import { ApiError, ImportResult, KvMetadata, SessionState, TxResult, TxStatus } from "./types";
+import { AdminKeyInfo, ApiError, CreatedUserspace, ImportResult, KvMetadata, SessionState, TxResult, TxStatus, UserspaceInfo } from "./types";
 
 const defaultApiBaseUrl = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8080";
 const sessionStorageKey = "httpkvdb.console.session";
@@ -73,8 +73,8 @@ export class ApiClient {
     return text;
   }
 
-  async putKey(key: string, value: Blob | string, contentType: string): Promise<KvMetadata> {
-    const response = await this.request(`/v1/kv/${encodeURIComponent(key)}`, {
+  async putKey(key: string, value: Blob | string, contentType: string, userspace?: string): Promise<KvMetadata> {
+    const response = await this.request(this.kvPath(key, userspace), {
       method: "PUT",
       headers: { "Content-Type": contentType },
       body: value
@@ -82,18 +82,64 @@ export class ApiClient {
     return metadataFromHeaders(response.headers);
   }
 
-  async getKey(key: string): Promise<{ value: ArrayBuffer; metadata: KvMetadata }> {
-    const response = await this.request(`/v1/kv/${encodeURIComponent(key)}`, { method: "GET" });
+  async getKey(key: string, userspace?: string): Promise<{ value: ArrayBuffer; metadata: KvMetadata }> {
+    const response = await this.request(this.kvPath(key, userspace), { method: "GET" });
     return { value: await response.arrayBuffer(), metadata: metadataFromHeaders(response.headers) };
   }
 
-  async headKey(key: string): Promise<KvMetadata> {
-    const response = await this.request(`/v1/kv/${encodeURIComponent(key)}`, { method: "HEAD" });
+  async headKey(key: string, userspace?: string): Promise<KvMetadata> {
+    const response = await this.request(this.kvPath(key, userspace), { method: "HEAD" });
     return metadataFromHeaders(response.headers);
   }
 
-  async deleteKey(key: string): Promise<void> {
-    await this.request(`/v1/kv/${encodeURIComponent(key)}`, { method: "DELETE" });
+  async deleteKey(key: string, userspace?: string): Promise<void> {
+    await this.request(this.kvPath(key, userspace), { method: "DELETE" });
+  }
+
+  async createUserspace(userspaceId: string, userId: string): Promise<CreatedUserspace> {
+    return this.json<CreatedUserspace>("/v1/admin/userspaces", {
+      method: "POST",
+      body: JSON.stringify({ userspace_id: userspaceId, user_id: userId || undefined })
+    });
+  }
+
+  async listUserspaces(): Promise<UserspaceInfo[]> {
+    return this.json<UserspaceInfo[]>("/v1/admin/userspaces", { method: "GET" });
+  }
+
+  async deleteUserspace(userspaceId: string): Promise<void> {
+    await this.request(`/v1/admin/userspaces/${encodeURIComponent(userspaceId)}`, { method: "DELETE" });
+  }
+
+  async rotateUserspaceAPIKey(userspaceId: string): Promise<CreatedUserspace> {
+    return this.json<CreatedUserspace>(`/v1/admin/userspaces/${encodeURIComponent(userspaceId)}/api-key`, { method: "POST" });
+  }
+
+  async listAdminKeys(userspaceId: string): Promise<AdminKeyInfo[]> {
+    return this.json<AdminKeyInfo[]>(`/v1/admin/userspaces/${encodeURIComponent(userspaceId)}/keys`, { method: "GET" });
+  }
+
+  async putAdminKey(userspaceId: string, key: string, value: Blob | string, contentType: string): Promise<KvMetadata> {
+    const response = await this.request(this.adminKvPath(userspaceId, key), {
+      method: "PUT",
+      headers: { "Content-Type": contentType },
+      body: value
+    });
+    return metadataFromHeaders(response.headers);
+  }
+
+  async getAdminKey(userspaceId: string, key: string): Promise<{ value: ArrayBuffer; metadata: KvMetadata }> {
+    const response = await this.request(this.adminKvPath(userspaceId, key), { method: "GET" });
+    return { value: await response.arrayBuffer(), metadata: metadataFromHeaders(response.headers) };
+  }
+
+  async headAdminKey(userspaceId: string, key: string): Promise<KvMetadata> {
+    const response = await this.request(this.adminKvPath(userspaceId, key), { method: "HEAD" });
+    return metadataFromHeaders(response.headers);
+  }
+
+  async deleteAdminKey(userspaceId: string, key: string): Promise<void> {
+    await this.request(this.adminKvPath(userspaceId, key), { method: "DELETE" });
   }
 
   async createTx(txId: string, totalOps: number, timeoutMs: number): Promise<TxStatus> {
@@ -164,10 +210,27 @@ export class ApiClient {
     return response.json() as Promise<T>;
   }
 
+  private kvPath(key: string, userspace?: string): string {
+    const encodedKey = encodeURIComponent(key);
+    const trimmedUserspace = userspace?.trim();
+    if (trimmedUserspace) {
+      return `/api/v1/${encodeURIComponent(trimmedUserspace)}/${encodedKey}`;
+    }
+    return `/v1/kv/${encodedKey}`;
+  }
+
+  private adminKvPath(userspaceId: string, key: string): string {
+    return `/v1/admin/userspaces/${encodeURIComponent(userspaceId)}/kv/${encodeURIComponent(key)}`;
+  }
+
   private async request(path: string, init: RequestInit): Promise<Response> {
     const headers = new Headers(init.headers);
     if (this.session.credential) {
-      headers.set("Authorization", `${this.session.authMode} ${this.session.credential}`);
+      if (this.session.authMode === "ApiKey") {
+        headers.set("APIKey", this.session.credential);
+      } else {
+        headers.set("Authorization", `Bearer ${this.session.credential}`);
+      }
     }
     const response = await fetch(`${this.session.apiBaseUrl}${path}`, { ...init, headers });
     if (!response.ok) {

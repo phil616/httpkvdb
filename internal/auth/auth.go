@@ -62,6 +62,10 @@ func APIKeyHash(key, pepper string) string {
 	return "hmac-sha256:" + hex.EncodeToString(mac.Sum(nil))
 }
 
+func (a *Authenticator) APIKeyPepper() string {
+	return a.apiKeyPepper
+}
+
 func (a *Authenticator) Invalidate() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -77,13 +81,23 @@ func PrincipalFromContext(ctx context.Context) (model.Principal, bool) {
 
 func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p, err := a.Authenticate(r.Header.Get("Authorization"))
+		p, err := a.AuthenticateRequest(r)
 		if err != nil {
 			writeAuthError(w, r)
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalKey{}, p)))
 	})
+}
+
+func (a *Authenticator) AuthenticateRequest(r *http.Request) (model.Principal, error) {
+	if key := strings.TrimSpace(r.Header.Get("APIKey")); key != "" {
+		return a.authenticateAPIKey(key)
+	}
+	if key := strings.TrimSpace(r.Header.Get("X-API-Key")); key != "" {
+		return a.authenticateAPIKey(key)
+	}
+	return a.Authenticate(r.Header.Get("Authorization"))
 }
 
 func (a *Authenticator) Authenticate(header string) (model.Principal, error) {
@@ -95,16 +109,7 @@ func (a *Authenticator) Authenticate(header string) (model.Principal, error) {
 		if key == "" {
 			return model.Principal{}, ErrUnauthorized
 		}
-		hash := APIKeyHash(key, a.apiKeyPepper)
-		if p, ok := a.getCache("apikey:" + hash); ok {
-			return p, nil
-		}
-		p, ok := a.store.ResolveAPIKeyHash(hash)
-		if !ok {
-			return model.Principal{}, ErrUnauthorized
-		}
-		a.setCache("apikey:"+hash, p)
-		return p, nil
+		return a.authenticateAPIKey(key)
 	}
 	if strings.HasPrefix(header, "Bearer ") {
 		token := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
@@ -124,6 +129,22 @@ func (a *Authenticator) Authenticate(header string) (model.Principal, error) {
 		return p, nil
 	}
 	return model.Principal{}, ErrUnauthorized
+}
+
+func (a *Authenticator) authenticateAPIKey(key string) (model.Principal, error) {
+	if key == "" {
+		return model.Principal{}, ErrUnauthorized
+	}
+	hash := APIKeyHash(key, a.apiKeyPepper)
+	if p, ok := a.getCache("apikey:" + hash); ok {
+		return p, nil
+	}
+	p, ok := a.store.ResolveAPIKeyHash(hash)
+	if !ok {
+		return model.Principal{}, ErrUnauthorized
+	}
+	a.setCache("apikey:"+hash, p)
+	return p, nil
 }
 
 func (a *Authenticator) getCache(k string) (model.Principal, bool) {

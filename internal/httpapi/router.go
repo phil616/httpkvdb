@@ -36,6 +36,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /metrics", s.metrics.Handler())
 	protected := s.auth.Middleware(http.HandlerFunc(s.v1))
 	mux.Handle("/v1/", protected)
+	mux.Handle("/api/v1/", protected)
 	handler := observe.RequestID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddUint64(&s.metrics.Requests, 1)
 		mux.ServeHTTP(w, r)
@@ -54,9 +55,14 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) v1(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/v1")
+	if strings.HasPrefix(r.URL.Path, "/api/v1/") {
+		path = strings.TrimPrefix(r.URL.Path, "/api/v1")
+	}
 	switch {
 	case strings.HasPrefix(path, "/kv/"):
 		s.handleKV(w, r, strings.TrimPrefix(path, "/kv/"))
+	case strings.HasPrefix(r.URL.Path, "/v1/admin/"):
+		s.handleAdmin(w, r, strings.TrimPrefix(path, "/admin/"))
 	case path == "/tx" && r.Method == http.MethodPost:
 		s.handleCreateTx(w, r)
 	case strings.HasPrefix(path, "/tx/"):
@@ -65,6 +71,8 @@ func (s *Server) v1(w http.ResponseWriter, r *http.Request) {
 		s.handleExport(w, r)
 	case path == "/import" && r.Method == http.MethodPost:
 		s.handleImport(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/v1/"):
+		s.handleUserspaceKV(w, r, strings.TrimPrefix(path, "/"))
 	default:
 		http.NotFound(w, r)
 	}

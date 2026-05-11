@@ -52,8 +52,13 @@ class Client:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
 
-    def request(self, method, path, body=None, content_type=None, headers=None, expected=None):
-        hdrs = {"Authorization": f"ApiKey {self.api_key}"}
+    def request(self, method, path, body=None, content_type=None, headers=None, expected=None, auth_header="Authorization"):
+        if auth_header == "APIKey":
+            hdrs = {"APIKey": self.api_key}
+        elif auth_header == "X-API-Key":
+            hdrs = {"X-API-Key": self.api_key}
+        else:
+            hdrs = {"Authorization": f"ApiKey {self.api_key}"}
         if headers:
             hdrs.update(headers)
         data = None
@@ -159,6 +164,8 @@ def main():
 
         run_check(report, "unauthenticated request rejected", lambda: unauthenticated_check(base_url))
         run_check(report, "json kv put/get/head/delete", lambda: kv_json_check(client))
+        run_check(report, "userspace url api and file mirror", lambda: userspace_url_and_file_mirror_check(client, data_dir))
+        run_check(report, "admin creates userspace api key", lambda: admin_create_userspace_check(client, base_url, data_dir))
         run_check(report, "invalid json rejected", lambda: invalid_json_check(client))
         run_check(report, "binary value round trip", lambda: binary_check(client))
         run_check(report, "transaction fragments not executed before commit", lambda: tx_visibility_check(client))
@@ -207,6 +214,44 @@ def kv_json_check(client):
     client.request("DELETE", f"/v1/kv/{key}", expected=204)
     client.request("GET", f"/v1/kv/{key}", expected=404)
     return "json CRUD, metadata headers, strict delete verified"
+
+
+def userspace_url_and_file_mirror_check(client, data_dir):
+    client.request("PUT", "/api/v1/prod_space/profile", b"Alice", content_type="text/plain", expected=200, auth_header="APIKey")
+    _, _, body = client.request("GET", "/api/v1/prod_space/profile", expected=200, auth_header="APIKey")
+    assert body == b"Alice", "userspace URL returned wrong value"
+    client.request("GET", "/api/v1/other_space/profile", expected=403, auth_header="APIKey")
+    text_path = os.path.join(data_dir, "userspaces", "prod_space", "profile.txt")
+    with open(text_path, "rb") as f:
+        assert f.read() == b"Alice", "text mirror mismatch"
+    client.request("PUT", "/api/v1/prod_space/profile", {"name": "Alice"}, expected=200, auth_header="APIKey")
+    assert not os.path.exists(text_path), "old text mirror still exists after JSON overwrite"
+    json_path = os.path.join(data_dir, "userspaces", "prod_space", "profile.json")
+    with open(json_path, "rb") as f:
+        assert json.loads(f.read())["name"] == "Alice", "json mirror mismatch"
+    return "APIKey header, userspace route isolation, and value file mirror verified"
+
+
+def admin_create_userspace_check(admin_client, base_url, data_dir):
+    _, _, payload = admin_client.request(
+        "POST",
+        "/v1/admin/userspaces",
+        {"userspace_id": "bob", "user_id": "bob"},
+        expected=201,
+        auth_header="APIKey",
+    )
+    created = json.loads(payload)
+    assert created["userspace_id"] == "bob", "created userspace mismatch"
+    assert created["api_key"], "generated api key missing"
+    bob = Client(base_url, created["api_key"])
+    bob.request("PUT", "/api/v1/bob/profile", b"Bob", content_type="text/plain", expected=200, auth_header="APIKey")
+    _, _, body = bob.request("GET", "/api/v1/bob/profile", expected=200, auth_header="APIKey")
+    assert body == b"Bob", "created userspace API key failed"
+    bob.request("GET", "/api/v1/prod_space/profile", expected=403, auth_header="APIKey")
+    admin_client.request("POST", "/v1/admin/userspaces", {"userspace_id": "bob", "user_id": "bob"}, expected=409, auth_header="APIKey")
+    with open(os.path.join(data_dir, "userspaces", "bob", "profile.txt"), "rb") as f:
+        assert f.read() == b"Bob", "created userspace file mirror mismatch"
+    return "admin-created userspace API key and duplicate conflict verified"
 
 
 def invalid_json_check(client):

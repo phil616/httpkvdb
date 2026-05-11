@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 )
@@ -14,8 +15,17 @@ var (
 	ErrInvalidJSON = errors.New("invalid json")
 )
 
+var userspaceIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
 func ValidateKey(key string, max int) error {
 	if key == "" || len(key) > max || !utf8.ValidString(key) {
+		return ErrInvalidKey
+	}
+	return nil
+}
+
+func ValidateUserspaceID(userspaceID string) error {
+	if userspaceID == "." || userspaceID == ".." || !userspaceIDPattern.MatchString(userspaceID) {
 		return ErrInvalidKey
 	}
 	return nil

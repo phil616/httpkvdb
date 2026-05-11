@@ -180,6 +180,8 @@ User KV Space
 
 普通用户不能通过 `/v1/kv`、`/v1/export`、`/v1/import` 访问认证空间。
 
+用户空间 URL 形态 `/api/v1/{userspace_id}/{key}` 允许客户端把 userspace 放在路径中，但该路径值只用于路由和可读性。服务端必须把它与认证结果中的 `Principal.userspace_id` 做一致性校验，校验失败返回 `403 FORBIDDEN`，不得把 URL 中的 userspace 作为授权来源。
+
 ---
 
 ## 6. 存储设计
@@ -262,6 +264,20 @@ checksum = sha256(value)
 ## 8. 普通 KV API
 
 普通 KV API 视为单操作事务，也必须进入全局锁。
+
+兼容路径：
+
+```text
+/v1/kv/{key}
+```
+
+用户空间路径：
+
+```text
+/api/v1/{userspace_id}/{key}
+```
+
+两种路径执行相同 KV 语义。`/api/v1/{userspace_id}/{key}` 必须先确认 `{userspace_id}` 与认证 Principal 的 `userspace_id` 一致。
 
 ### 8.1 写入或覆盖
 
@@ -819,6 +835,13 @@ Authorization: Bearer <jwt>
 Authorization: ApiKey <api_key>
 ```
 
+为了兼容 userspace URL API，也支持直接 APIKey Header：
+
+```http
+APIKey: <api_key>
+X-API-Key: <api_key>
+```
+
 ### 15.2 JWT 验证
 
 JWT 验证流程：
@@ -835,7 +858,7 @@ JWT 验证流程：
 
 APIKey 验证流程：
 
-1. 解析 Authorization Header。
+1. 解析 `APIKey`、`X-API-Key` 或 `Authorization` Header。
 2. 提取 APIKey 明文。
 3. 计算 hash。
 4. 查询系统认证空间中的 api_key_hash。
@@ -1174,6 +1197,7 @@ Storage
 - Exists(userspace_id, key) -> bool
 - ExportUserspace(userspace_id) -> []KVRecord
 - ImportUserspace(userspace_id, records, mode) -> ImportResult
+- CreateUserspace(userspace_id, user_id, api_key_hash) -> error
 - BeginAtomic() -> AtomicTx
 ```
 
@@ -1221,6 +1245,7 @@ Codex 实现时必须补充自动化测试。
 12. 事务内 GET 读到前序 PUT。
 13. 事务失败 rollback。
 14. 导入导出 checksum。
+15. userspace_id 校验。
 
 ### 22.2 集成测试
 
@@ -1236,6 +1261,10 @@ Codex 实现时必须补充自动化测试。
 8. replace / merge-overwrite / merge-skip 三种导入模式。
 9. 大二进制 value 存取。
 10. 服务重启后已提交数据存在。
+11. `/api/v1/{userspace}/{key}` 匹配认证 userspace 时可访问。
+12. `/api/v1/{userspace}/{key}` 不匹配认证 userspace 时返回 403。
+13. 管理员创建 userspace 后生成可用 APIKey。
+14. 重复创建同一 userspace 返回冲突。
 
 ### 22.3 并发测试
 
@@ -1258,6 +1287,7 @@ Codex 实现时必须补充自动化测试。
 2. 支持从环境变量注入初始 APIKey。
 3. 初始 APIKey 只保存 hash。
 4. 初始用户拥有一个 userspace。
+5. 管理员可以创建新的 userspace，并为其生成 APIKey。
 
 建议环境变量：
 
@@ -1269,6 +1299,46 @@ KVHTTP_BOOTSTRAP_API_KEY=dev-secret-key
 
 生产环境中应提示用户更换初始 APIKey。
 
+管理员创建 userspace API：
+
+```http
+POST /v1/admin/userspaces
+APIKey: <admin_api_key>
+Content-Type: application/json
+
+{
+  "userspace_id": "alice",
+  "user_id": "alice"
+}
+```
+
+成功返回：
+
+```json
+{
+  "user_id": "alice",
+  "userspace_id": "alice",
+  "api_key": "generated-plaintext-api-key"
+}
+```
+
+`api_key` 明文只允许在创建响应中返回一次，磁盘中只能保存其 HMAC-SHA256 摘要。重复创建同一 userspace 必须返回 `409 USERSPACE_EXISTS`。
+
+管理员 userspace 管理 API：
+
+```text
+GET    /v1/admin/userspaces
+DELETE /v1/admin/userspaces/{userspace_id}
+POST   /v1/admin/userspaces/{userspace_id}/api-key
+GET    /v1/admin/userspaces/{userspace_id}/keys
+PUT    /v1/admin/userspaces/{userspace_id}/kv/{key}
+GET    /v1/admin/userspaces/{userspace_id}/kv/{key}
+HEAD   /v1/admin/userspaces/{userspace_id}/kv/{key}
+DELETE /v1/admin/userspaces/{userspace_id}/kv/{key}
+```
+
+以上接口必须要求 `admin` 角色。管理员 KV 操作用于颗粒化运维管理，必须和普通 CRUD 一样经过全局串行化锁，不得记录原始 value。APIKey 轮换只允许在响应中返回新明文一次，并应使旧 APIKey 失效。
+
 ---
 
 ## 24. 安全要求
@@ -1276,7 +1346,7 @@ KVHTTP_BOOTSTRAP_API_KEY=dev-secret-key
 1. 不保存 APIKey 明文。
 2. 日志不得打印 Authorization Header。
 3. 日志不得打印 value。
-4. userspace_id 不接受客户端直接传入。
+4. userspace_id 不得直接信任客户端传入值；如果 URL 中包含 userspace_id，必须与 Principal.userspace_id 校验一致。
 5. tx_id 必须绑定用户身份。
 6. 导入数据必须限制大小。
 7. 单个 value 必须限制大小。
@@ -1284,7 +1354,7 @@ KVHTTP_BOOTSTRAP_API_KEY=dev-secret-key
 9. 事务 body 缓冲必须限制总大小。
 10. 所有错误响应不得泄露底层文件路径。
 11. HTTP handler 必须设置合理的 request body size limit。
-12. 对外默认只开放 `/v1/*`、`/healthz`、`/readyz`、`/metrics`。
+12. 对外默认只开放 `/v1/*`、`/api/v1/*`、`/healthz`、`/readyz`、`/metrics`。
 
 ---
 

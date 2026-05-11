@@ -69,9 +69,9 @@ Expected summary:
 
 ```json
 {
-  "passed": 11,
+  "passed": 13,
   "failed": 0,
-  "total": 11
+  "total": 13
 }
 ```
 
@@ -83,6 +83,13 @@ Recommended minimal production layout:
 /usr/local/bin/kvhttpd
 /etc/httpkvdb/kvhttpd.env
 /var/lib/httpkvdb/
+```
+
+Runtime data is written under `KVHTTP_STORAGE_PATH`:
+
+```text
+/var/lib/httpkvdb/httpkvdb.json
+/var/lib/httpkvdb/userspaces/{userspace}/
 ```
 
 Set permissions:

@@ -21,6 +21,12 @@ func TestValidateKeyAndValueType(t *testing.T) {
 	if err := ValidateValue("application/json", []byte(`{"bad"`)); err != ErrInvalidJSON {
 		t.Fatalf("expected invalid json, got %v", err)
 	}
+	if err := ValidateUserspaceID("alice"); err != nil {
+		t.Fatalf("expected userspace valid: %v", err)
+	}
+	if err := ValidateUserspaceID("../alice"); err == nil {
+		t.Fatalf("expected path-like userspace invalid")
+	}
 }
 
 func TestStorePersistsUserspaceIsolation(t *testing.T) {

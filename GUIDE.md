@@ -3,22 +3,48 @@
 This file is the client contract for AI agents that need to use an HTTPKVDB instance after a human provides:
 
 - `BASE_URL`: HTTPKVDB service origin, for example `https://kvdb-api.example.com`
+- `APP_NAME`: the third-party application name, used as the HTTPKVDB userspace, for example `webapp`
 - `API_KEY`: API key plaintext
 
 Treat `API_KEY`, JWTs, `Authorization`, request bodies, and response values as secrets unless the task explicitly says otherwise. Do not log them.
 
+## Application Userspace Contract
+
+Every third-party application must use its own application name as its HTTPKVDB userspace.
+
+Example:
+
+- application name: `webapp`
+- userspace: `webapp`
+- KV path prefix: `/api/v1/webapp/`
+
+The HTTPKVDB administrator creates that userspace and gives the application operator:
+
+- the service address, such as `https://kvdb-api.example.com`
+- the APIKey generated for that userspace
+
+The application must then perform all ordinary KV operations inside its dedicated userspace:
+
+```text
+https://kvdb-api.example.com/api/v1/webapp/{url-encoded-key}
+```
+
+Do not use another application name as the userspace. Do not share one userspace across unrelated applications. The server rejects a URL userspace that does not match the APIKey's authenticated principal with `403 FORBIDDEN`.
+
 ## Connection Model
 
-HTTPKVDB is a single-node strongly consistent KV database exposed over HTTP. All authenticated endpoints are under `/v1`. Each credential resolves server-side to exactly one `userspace`; clients must not send or infer a `userspace_id`.
+HTTPKVDB is a single-node strongly consistent KV database exposed over HTTP. Authenticated endpoints are under `/v1` and `/api/v1`. Each credential resolves server-side to exactly one `userspace`; `/api/v1/{userspace}/{key}` is allowed only when the URL userspace matches the authenticated principal.
 
 Use HTTPS when available. For every authenticated request, send one of:
 
 ```http
 Authorization: ApiKey <API_KEY>
 Authorization: Bearer <JWT>
+APIKey: <API_KEY>
+X-API-Key: <API_KEY>
 ```
 
-When a human gives an API key, use `Authorization: ApiKey <API_KEY>`.
+When a human gives an API key, prefer `APIKey: <API_KEY>` for the userspace URL API. `Authorization: ApiKey <API_KEY>` remains supported for all authenticated APIs.
 
 Optional request correlation:
 
@@ -42,6 +68,7 @@ Keys are strings and are placed in the URL path:
 
 ```text
 /v1/kv/{url-encoded-key}
+/api/v1/{userspace}/{url-encoded-key}
 ```
 
 Always URL-encode the full key as one path segment. Encode `/` as `%2F`; do not let HTTP client path normalization split the key.
@@ -51,6 +78,7 @@ Examples:
 - key `profile` -> `/v1/kv/profile`
 - key `agents/session/42` -> `/v1/kv/agents%2Fsession%2F42`
 - key `a b` -> `/v1/kv/a%20b`
+- app/userspace `webapp`, key `profile` -> `/api/v1/webapp/profile`
 
 ## Value Types
 
@@ -72,7 +100,7 @@ Ordinary `PUT`, `GET`, `HEAD`, and `DELETE` are single-operation serializable tr
 
 ```http
 PUT /v1/kv/{key}
-Authorization: ApiKey <API_KEY>
+APIKey: <API_KEY>
 Content-Type: application/json
 
 {"state":"ready"}
@@ -91,7 +119,7 @@ The response body is empty. Existing keys are overwritten.
 
 ```http
 GET /v1/kv/{key}
-Authorization: ApiKey <API_KEY>
+APIKey: <API_KEY>
 ```
 
 Success:
@@ -116,7 +144,7 @@ Not found:
 
 ```http
 HEAD /v1/kv/{key}
-Authorization: ApiKey <API_KEY>
+APIKey: <API_KEY>
 ```
 
 Same metadata headers as `GET`, no body.
@@ -125,7 +153,7 @@ Same metadata headers as `GET`, no body.
 
 ```http
 DELETE /v1/kv/{key}
-Authorization: ApiKey <API_KEY>
+APIKey: <API_KEY>
 ```
 
 Success:
@@ -135,6 +163,66 @@ HTTP/1.1 204 No Content
 ```
 
 Deleting a missing key returns `404 KEY_NOT_FOUND`.
+
+### Application Userspace URL API
+
+Third-party applications should use the userspace URL API. `{userspace}` must be the application name assigned by the administrator:
+
+```http
+PUT /api/v1/{userspace}/{key}
+GET /api/v1/{userspace}/{key}
+HEAD /api/v1/{userspace}/{key}
+DELETE /api/v1/{userspace}/{key}
+APIKey: <API_KEY>
+```
+
+For example, an application named `webapp` stores its `profile` key at:
+
+```http
+PUT /api/v1/webapp/profile
+APIKey: <WEBAPP_API_KEY>
+Content-Type: application/json
+
+{"enabled":true}
+```
+
+The server rejects mismatches between `{userspace}` and the authenticated principal with `403 FORBIDDEN`.
+
+## Admin Userspaces
+
+Only principals with the `admin` role may manage userspaces and their KV data.
+
+```http
+POST /v1/admin/userspaces
+APIKey: <ADMIN_API_KEY>
+Content-Type: application/json
+
+{"userspace_id":"webapp","user_id":"webapp"}
+```
+
+Success:
+
+```json
+{"user_id":"webapp","userspace_id":"webapp","api_key":"..."}
+```
+
+The generated `api_key` is plaintext and returned only in this response. The server stores only its HMAC-SHA256 digest. Re-creating an existing userspace returns `409 USERSPACE_EXISTS`.
+
+Management endpoints:
+
+```http
+GET    /v1/admin/userspaces
+DELETE /v1/admin/userspaces/{userspace}
+POST   /v1/admin/userspaces/{userspace}/api-key
+GET    /v1/admin/userspaces/{userspace}/keys
+PUT    /v1/admin/userspaces/{userspace}/kv/{key}
+GET    /v1/admin/userspaces/{userspace}/kv/{key}
+HEAD   /v1/admin/userspaces/{userspace}/kv/{key}
+DELETE /v1/admin/userspaces/{userspace}/kv/{key}
+APIKey: <ADMIN_API_KEY>
+```
+
+`POST /v1/admin/userspaces/{userspace}/api-key` replaces that userspace's APIKey and returns the new plaintext key once. Admin KV operations are for granular operational management and still pass through the global serializable lock.
 
 ## Multi-Request Transactions
 
@@ -344,12 +432,14 @@ Common status/error pairs:
 
 - `400 BAD_REQUEST`: malformed request
 - `400 INVALID_KEY`: invalid key
+- `400 INVALID_USERSPACE`: invalid userspace identifier
 - `400 INVALID_TX`: invalid transaction parameter or operation
 - `401 UNAUTHORIZED`: missing/invalid credential
 - `403 FORBIDDEN`: transaction belongs to another principal
 - `404 KEY_NOT_FOUND`: key missing
 - `404 TX_NOT_FOUND`: transaction missing
 - `409 SEQ_CONFLICT`: same transaction sequence received different content
+- `409 USERSPACE_EXISTS`: userspace already exists
 - `409 TX_ALREADY_COMMITTED`: transaction already committed
 - `409 TX_ABORTED`: transaction aborted
 - `410 TX_EXPIRED`: transaction deadline passed
@@ -359,30 +449,33 @@ Common status/error pairs:
 
 ## Minimal Agent Client Algorithm
 
-Given `(BASE_URL, API_KEY)`:
+Given `(BASE_URL, APP_NAME, API_KEY)`:
 
 1. Normalize `BASE_URL` by removing trailing `/`.
-2. For authenticated calls, set `Authorization: ApiKey ${API_KEY}`.
-3. Encode keys with path-segment percent encoding.
-4. Use ordinary KV calls for single-key operations.
-5. Use transactions when the requested action requires atomic multi-step read/write/delete semantics.
-6. On `401`, stop and ask for a valid credential.
-7. On `404 KEY_NOT_FOUND`, treat as absent key, not transport failure.
-8. On `409` or `410` for transactions, create a new transaction unless the task requires preserving the original transaction ID.
-9. Never include secrets or raw values in logs, trace summaries, error reports, or prompts unless explicitly authorized.
+2. Treat `APP_NAME` as the userspace.
+3. For authenticated calls, set `APIKey: ${API_KEY}`.
+4. Encode keys with path-segment percent encoding.
+5. Use `/api/v1/${APP_NAME}/${encodedKey}` for ordinary KV operations.
+6. Use transactions only when the action requires atomic multi-step read/write/delete semantics; transaction APIs still bind to the APIKey's userspace server-side.
+7. On `401`, stop and ask for a valid credential.
+8. On `403`, verify that `APP_NAME` exactly matches the userspace created by the administrator for this APIKey.
+9. On `404 KEY_NOT_FOUND`, treat as absent key, not transport failure.
+10. On `409` or `410` for transactions, create a new transaction unless the task requires preserving the original transaction ID.
+11. Never include secrets or raw values in logs, trace summaries, error reports, or prompts unless explicitly authorized.
 
 ## Curl Smoke Test
 
 ```sh
 BASE_URL="https://kvdb-api.example.com"
 API_KEY="provided-by-human"
+APP_NAME="webapp"
 KEY="$(python3 -c 'import urllib.parse; print(urllib.parse.quote("agent/smoke", safe=""))')"
 
-curl -fsS -X PUT "$BASE_URL/v1/kv/$KEY" \
-  -H "Authorization: ApiKey $API_KEY" \
+curl -fsS -X PUT "$BASE_URL/api/v1/$APP_NAME/$KEY" \
+  -H "APIKey: $API_KEY" \
   -H "Content-Type: application/json" \
   --data '{"ok":true}'
 
-curl -fsS "$BASE_URL/v1/kv/$KEY" \
-  -H "Authorization: ApiKey $API_KEY"
+curl -fsS "$BASE_URL/api/v1/$APP_NAME/$KEY" \
+  -H "APIKey: $API_KEY"
 ```

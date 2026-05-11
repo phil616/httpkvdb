@@ -2,9 +2,11 @@ package httpapi
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,6 +42,12 @@ func newTestHTTP(t *testing.T, dir string) http.Handler {
 	if err := s.UpsertAPIKeyHash(auth.APIKeyHash("key-b", "pepper"), model.Principal{UserID: "b", UserspaceID: "space-b"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.UpsertAPIKeyHash(auth.APIKeyHash("key-alice", "pepper"), model.Principal{UserID: "alice", UserspaceID: "alice"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertAPIKeyHash(auth.APIKeyHash("key-admin", "pepper"), model.Principal{UserID: "admin", UserspaceID: "admin", Roles: []string{"admin"}}); err != nil {
+		t.Fatal(err)
+	}
 	serial := &lock.Serializable{}
 	authn := auth.New(s, "jwt-secret", "pepper", "", "", time.Minute, 100)
 	coord := httptx.NewCoordinator(s, serial, cfg.MaxTxOps, time.Second, 10*time.Second)
@@ -72,6 +80,93 @@ func TestHTTPInvalidJSONAndBinary(t *testing.T) {
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("binary mismatch: %v", got)
 	}
+}
+
+func TestHTTPUserspacePathAPIKeyHeaderAndFileMirror(t *testing.T) {
+	dir := t.TempDir()
+	h := newTestHTTP(t, dir)
+	doWithAPIKeyHeader(t, h, http.MethodPut, "/api/v1/alice/profile", "key-alice", "text/plain", []byte("Alice"), http.StatusOK)
+	if got := doWithAPIKeyHeader(t, h, http.MethodGet, "/api/v1/alice/profile", "key-alice", "", nil, http.StatusOK); string(got) != "Alice" {
+		t.Fatalf("userspace path get mismatch: %q", string(got))
+	}
+	doWithAPIKeyHeader(t, h, http.MethodGet, "/api/v1/space-b/profile", "key-alice", "", nil, http.StatusForbidden)
+	assertFile(t, dir+"/userspaces/alice/profile.txt", "Alice")
+
+	doWithAPIKeyHeader(t, h, http.MethodPut, "/api/v1/alice/profile", "key-alice", "application/json", []byte(`{"name":"Alice"}`), http.StatusOK)
+	assertMissing(t, dir+"/userspaces/alice/profile.txt")
+	assertFile(t, dir+"/userspaces/alice/profile.json", `{"name":"Alice"}`)
+
+	doWithAPIKeyHeader(t, h, http.MethodPut, "/api/v1/alice/avatar", "key-alice", "application/octet-stream", []byte{0, 1, 2}, http.StatusOK)
+	assertFileBytes(t, dir+"/userspaces/alice/avatar.bin", []byte{0, 1, 2})
+
+	doWithAPIKeyHeader(t, h, http.MethodPut, "/api/v1/alice/mixed", "key-alice", "image/png", []byte{3, 4}, http.StatusOK)
+	assertFileBytes(t, dir+"/userspaces/alice/mixed", []byte{3, 4})
+}
+
+func TestHTTPAdminCreateUserspace(t *testing.T) {
+	h := newTestHTTP(t, t.TempDir())
+	body := []byte(`{"userspace_id":"bob","user_id":"bob"}`)
+	res := do(t, h, http.MethodPost, "/v1/admin/userspaces", "key-admin", "application/json", body, http.StatusCreated)
+	var out struct {
+		UserID      string `json:"user_id"`
+		UserspaceID string `json:"userspace_id"`
+		APIKey      string `json:"api_key"`
+	}
+	if err := json.NewDecoder(bytes.NewReader(res)).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.UserID != "bob" || out.UserspaceID != "bob" || out.APIKey == "" {
+		t.Fatalf("unexpected create userspace response: %+v", out)
+	}
+	doWithAPIKeyHeader(t, h, http.MethodPut, "/api/v1/bob/profile", out.APIKey, "text/plain", []byte("Bob"), http.StatusOK)
+	if got := doWithAPIKeyHeader(t, h, http.MethodGet, "/api/v1/bob/profile", out.APIKey, "", nil, http.StatusOK); string(got) != "Bob" {
+		t.Fatalf("created userspace get mismatch: %q", string(got))
+	}
+	do(t, h, http.MethodPost, "/v1/admin/userspaces", "key-admin", "application/json", body, http.StatusConflict)
+	do(t, h, http.MethodPost, "/v1/admin/userspaces", "key-a", "application/json", []byte(`{"userspace_id":"eve"}`), http.StatusForbidden)
+}
+
+func TestHTTPAdminUserspaceAndKVManagement(t *testing.T) {
+	h := newTestHTTP(t, t.TempDir())
+	do(t, h, http.MethodGet, "/v1/admin/userspaces", "key-a", "", nil, http.StatusForbidden)
+	res := do(t, h, http.MethodPost, "/v1/admin/userspaces", "key-admin", "application/json", []byte(`{"userspace_id":"managed","user_id":"managed-user"}`), http.StatusCreated)
+	var created struct {
+		APIKey string `json:"api_key"`
+	}
+	if err := json.NewDecoder(bytes.NewReader(res)).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	if created.APIKey == "" {
+		t.Fatal("missing generated api key")
+	}
+	do(t, h, http.MethodPut, "/v1/admin/userspaces/managed/kv/profile", "key-admin", "text/plain", []byte("admin-write"), http.StatusOK)
+	if got := do(t, h, http.MethodGet, "/api/v1/managed/profile", created.APIKey, "", nil, http.StatusOK); string(got) != "admin-write" {
+		t.Fatalf("managed userspace read mismatch: %q", string(got))
+	}
+	keys := do(t, h, http.MethodGet, "/v1/admin/userspaces/managed/keys", "key-admin", "", nil, http.StatusOK)
+	if !strings.Contains(string(keys), `"key":"profile"`) || strings.Contains(string(keys), "admin-write") {
+		t.Fatalf("unexpected key listing: %s", string(keys))
+	}
+	listed := do(t, h, http.MethodGet, "/v1/admin/userspaces", "key-admin", "", nil, http.StatusOK)
+	if !strings.Contains(string(listed), `"userspace_id":"managed"`) {
+		t.Fatalf("userspace not listed: %s", string(listed))
+	}
+	rotated := do(t, h, http.MethodPost, "/v1/admin/userspaces/managed/api-key", "key-admin", "application/json", nil, http.StatusOK)
+	var out struct {
+		APIKey string `json:"api_key"`
+	}
+	if err := json.NewDecoder(bytes.NewReader(rotated)).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.APIKey == "" || out.APIKey == created.APIKey {
+		t.Fatalf("invalid rotated api key")
+	}
+	do(t, h, http.MethodGet, "/api/v1/managed/profile", created.APIKey, "", nil, http.StatusUnauthorized)
+	do(t, h, http.MethodGet, "/api/v1/managed/profile", out.APIKey, "", nil, http.StatusOK)
+	do(t, h, http.MethodDelete, "/v1/admin/userspaces/managed/kv/profile", "key-admin", "", nil, http.StatusNoContent)
+	do(t, h, http.MethodGet, "/api/v1/managed/profile", out.APIKey, "", nil, http.StatusNotFound)
+	do(t, h, http.MethodDelete, "/v1/admin/userspaces/managed", "key-admin", "", nil, http.StatusNoContent)
+	do(t, h, http.MethodGet, "/api/v1/managed/profile", out.APIKey, "", nil, http.StatusUnauthorized)
 }
 
 func TestHTTPExportImportModes(t *testing.T) {
@@ -157,7 +252,7 @@ func TestCORSPreflightAllowsViteDevOriginWithoutAuth(t *testing.T) {
 	req := httptest.NewRequest(http.MethodOptions, "/v1/kv/profile", nil)
 	req.Header.Set("Origin", "http://127.0.0.1:5173")
 	req.Header.Set("Access-Control-Request-Method", "PUT")
-	req.Header.Set("Access-Control-Request-Headers", "Authorization, Content-Type, X-KV-Op")
+	req.Header.Set("Access-Control-Request-Headers", "Authorization, APIKey, X-API-Key, Content-Type, X-KV-Op")
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusNoContent {
@@ -166,7 +261,7 @@ func TestCORSPreflightAllowsViteDevOriginWithoutAuth(t *testing.T) {
 	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "http://127.0.0.1:5173" {
 		t.Fatalf("allow origin = %q", got)
 	}
-	if got := rr.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(got, "Authorization") || !strings.Contains(got, "X-KV-Op") {
+	if got := rr.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(got, "Authorization") || !strings.Contains(got, "APIKey") || !strings.Contains(got, "X-API-Key") || !strings.Contains(got, "X-KV-Op") {
 		t.Fatalf("allow headers missing expected values: %q", got)
 	}
 	if got := rr.Header().Get("Access-Control-Expose-Headers"); !strings.Contains(got, "X-KV-Version") || !strings.Contains(got, "X-KV-Checksum") {
@@ -202,4 +297,42 @@ func doWithMode(t *testing.T, h http.Handler, path, key, mode string, body []byt
 		t.Fatalf("import got status %d want %d body=%s", rr.Code, want, rr.Body.String())
 	}
 	return rr.Body.Bytes()
+}
+
+func doWithAPIKeyHeader(t *testing.T, h http.Handler, method, path, key, ct string, body []byte, want int) []byte {
+	t.Helper()
+	req := httptest.NewRequest(method, path, bytes.NewReader(body))
+	req.Header.Set("APIKey", key)
+	if ct != "" {
+		req.Header.Set("Content-Type", ct)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != want {
+		t.Fatalf("%s %s got status %d want %d body=%s", method, path, rr.Code, want, rr.Body.String())
+	}
+	return rr.Body.Bytes()
+}
+
+func assertFile(t *testing.T, path, want string) {
+	t.Helper()
+	assertFileBytes(t, path, []byte(want))
+}
+
+func assertFileBytes(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("%s = %q want %q", path, string(got), string(want))
+	}
+}
+
+func assertMissing(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("%s exists or stat failed with unexpected error: %v", path, err)
+	}
 }

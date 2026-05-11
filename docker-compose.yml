@@ -15,6 +15,7 @@ services:
       KVHTTP_API_KEY_PEPPER: "${KVHTTP_API_KEY_PEPPER:?set KVHTTP_API_KEY_PEPPER}"
       KVHTTP_JWT_SECRET: "${KVHTTP_JWT_SECRET:?set KVHTTP_JWT_SECRET}"
     volumes:
+      # Contains /data/httpkvdb.json and /data/userspaces/{userspace}/ value files.
       - httpkvdb_data:/data
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/readyz"]
