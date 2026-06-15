@@ -1,0 +1,4 @@
+interface:
+  display_name: "HTTPKVDB Persistence"
+  short_description: "Design and test HTTPKVDB persistence"
+  default_prompt: "Use $httpkvdb-persistence to design HTTPKVDB keys, transactions, tests, and migration steps for this app."
