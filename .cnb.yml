@@ -183,7 +183,7 @@ main:
             - https://cnb.cool/greenshadecapital/dreamreflex/assets-secrets/-/blob/main/api-server.yml
           settings:
             urls:
-              - https://api.dreamreflex.com/api/email/send-common
+              - https://api.altasci.com/api/email/send-common
             method: POST
             content_type: application/json
             template: |
