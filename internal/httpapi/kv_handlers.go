@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"errors"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -16,7 +15,7 @@ import (
 func (s *Server) handleUserspaceKV(w http.ResponseWriter, r *http.Request, rawPath string) {
 	rawUserspaceID, rawKey, ok := strings.Cut(rawPath, "/")
 	if !ok || rawUserspaceID == "" || rawKey == "" {
-		http.NotFound(w, r)
+		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "route not found")
 		return
 	}
 	userspaceID, err := url.PathUnescape(rawUserspaceID)
@@ -49,7 +48,8 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request, rawKey string)
 	case http.MethodDelete:
 		s.handleDelete(w, r, p.UserspaceID, key)
 	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Header().Set("Allow", "GET, HEAD, PUT, DELETE")
+		writeError(w, r, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 	}
 }
 
@@ -58,9 +58,9 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, userspaceID, 
 	if !ok {
 		return
 	}
-	ct := r.Header.Get("Content-Type")
-	if ct == "" {
-		ct = "application/octet-stream"
+	ct, ok := requestContentType(w, r)
+	if !ok {
+		return
 	}
 	if err := storage.ValidateValue(ct, body); err != nil {
 		writeError(w, r, http.StatusUnprocessableEntity, "INVALID_JSON", "invalid json")
@@ -80,8 +80,8 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, userspaceID, 
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, userspaceID, key string, head bool) {
 	s.lock.Lock()
-	defer s.lock.Unlock()
 	rec, err := s.store.Get(userspaceID, key)
+	s.lock.Unlock()
 	if errors.Is(err, storage.ErrNotFound) {
 		writeError(w, r, http.StatusNotFound, "KEY_NOT_FOUND", "key not found")
 		return
@@ -118,10 +118,9 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, userspaceI
 }
 
 func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
-	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxValueSize)
-	body, err := io.ReadAll(r.Body)
+	body, err := readLimitedBody(w, r, s.cfg.MaxValueSize)
 	if err != nil {
-		writeError(w, r, http.StatusRequestEntityTooLarge, "VALUE_TOO_LARGE", "value too large")
+		writeBodyError(w, r, err)
 		return nil, false
 	}
 	return body, true

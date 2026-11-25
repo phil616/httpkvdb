@@ -70,6 +70,7 @@ type Transaction struct {
 	Status         TxStatus            `json:"status"`
 	CreatedAt      time.Time           `json:"created_at"`
 	Deadline       time.Time           `json:"deadline"`
+	FinishedAt     time.Time           `json:"finished_at,omitempty"`
 	CommitReceived bool                `json:"commit_received"`
 	TxDigest       string              `json:"tx_digest,omitempty"`
 	Ops            map[int]TxOperation `json:"ops"`

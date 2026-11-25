@@ -21,8 +21,7 @@ GitHub CI/发布配置见 [docs/GITHUB.md](docs/GITHUB.md)，版本同步规则�
 ## 环境要求
 
 - Go 1.22+ 源码兼容；首选构建工具链由 `go.mod` 指定为 Go 1.26.2
-- Python 3.11+，用于运行生产风格功能测试脚本
-- `uv`，用于本地运行 Python 测试脚本
+- Python 3.11+ 标准库，用于运行生产风格功能测试脚本（`uv` 可选）
 
 ## 构建
 
@@ -61,7 +60,9 @@ cp configs/kvhttpd.env.example .env.local
 ./bin/kvhttpd --config .env.local
 ```
 
-当指定 `--config` 时，服务只从该文件读取配置，文件中未写的项使用内置默认值，不再从进程环境变量补齐。未指定 `--config` 时，服务回落为从环境变量读取配置。
+当指定 `--config` 时，服务只从该文件读取配置，文件中未写或为空的项使用内置默认值，不再从进程环境变量补齐。未指定 `--config` 时，仅加载进程环境中以 `KVHTTP_` 开头的变量。未知配置名、重复文件配置名、非法数值或不匹配的引号会使启动失败。
+
+配置文件不是 shell：支持 `KEY=value`、单引号字面量、双引号 Go 转义、`export ` 前缀及整行注释；不执行变量/命令展开，不支持行内注释。数值限制必须为正，默认事务超时不得大于最大超时。
 
 关键配置项：
 
@@ -78,7 +79,9 @@ KVHTTP_STORAGE_PATH=./data
 # 限制项
 KVHTTP_MAX_KEY_SIZE=4096
 KVHTTP_MAX_VALUE_SIZE=104857600
+KVHTTP_MAX_IMPORT_SIZE=1073741824
 KVHTTP_MAX_TX_OPS=1000
+KVHTTP_MAX_TX_BODY_SIZE=268435456
 
 # 事务超时和清理
 KVHTTP_DEFAULT_TX_TIMEOUT_MS=30000
@@ -252,6 +255,12 @@ docker compose down -v
    sudo editor /etc/httpkvdb/kvhttpd.env
    ```
 
+配置文件中应明确设置以下绝对路径（`--config` 不合并环境变量）：
+
+   ```bash
+   KVHTTP_STORAGE_PATH=/var/lib/httpkvdb
+   ```
+
 5. 手动启动：
 
    ```bash
@@ -270,6 +279,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+WorkingDirectory=/var/lib/httpkvdb
 ExecStart=/usr/local/bin/kvhttpd --config /etc/httpkvdb/kvhttpd.env
 Restart=on-failure
 RestartSec=2s
@@ -329,7 +339,7 @@ go build -trimpath -ldflags='-s -w' -o bin/kvhttpd ./cmd/kvhttpd
 运行测试：
 
 ```bash
-uv run python scripts/production_test.py --binary ./bin/kvhttpd --port 18080
+python3 scripts/production_test.py --binary ./bin/kvhttpd --port 18080
 ```
 
 脚本会验证：
@@ -340,7 +350,7 @@ uv run python scripts/production_test.py --binary ./bin/kvhttpd --port 18080
 - 非法 JSON 返回 `422`
 - `/api/v1/{userspace}/{key}` 与 `APIKey` Header
 - 管理员创建 userspace 并生成 APIKey
-- userspace 文件镜像
+- 特殊字符、长 Key 与 userspace 路径隔离
 - 二进制 value 往返
 - 事务片段在 commit 前不可见
 - 乱序事务片段按 `seq` 执行
@@ -354,14 +364,14 @@ uv run python scripts/production_test.py --binary ./bin/kvhttpd --port 18080
 如果需要保留临时数据目录用于排查：
 
 ```bash
-uv run python scripts/production_test.py --binary ./bin/kvhttpd --port 18080 --keep-data
+python3 scripts/production_test.py --binary ./bin/kvhttpd --port 18080 --keep-data
 ```
 
 ## HTTP API 快速参考
 
-所有需要认证的 API 使用 `/v1` 前缀。
+认证 API 使用 `/v1/*`；用户空间 KV 路径使用 `/api/v1/{userspace}/{key}`。
 
-认证方式：
+认证方式（四种方式任选其一，不要同时发送多种或重复 Header）：
 
 ```http
 Authorization: ApiKey <api_key>
@@ -425,24 +435,23 @@ GET /metrics
 
 ## 存储
 
-当前存储后端会在 `KVHTTP_STORAGE_PATH` 下写入一个 JSON 快照文件，并同步生成按 userspace 分组的 KV 文件镜像：
+存储使用本地嵌入式事务数据库 [bbolt](https://github.com/etcd-io/bbolt/tree/v1.3.11)，数据目录由 `KVHTTP_STORAGE_PATH` 指定：
 
 ```text
-<storage-path>/httpkvdb.json
-<storage-path>/userspaces/{userspace}/{key}.txt
-<storage-path>/userspaces/{userspace}/{key}.json
-<storage-path>/userspaces/{userspace}/{key}.bin
-<storage-path>/userspaces/{userspace}/{key}
+<storage-path>/httpkvdb.db
 ```
 
-文件中包含逻辑隔离的数据区：
+用户 KV、APIKey 摘要、JWT subject、事务片段和结果使用独立 bucket。写入使用同步持久化的原子事务；KV 更新与事务结果一起提交。Key 只作为数据库键保存，不转换为文件名，支持默认上限 4096 字节的 Key。数据库文件有独占锁，同一目录不能同时启动第二个实例。
 
-- 用户 KV 空间
-- 系统 APIKey 记录
-- 系统 JWT subject 记录
-- 事务状态和已提交事务结果
+首次打开旧数据目录时，会将 `httpkvdb.json` 中的 KV、认证、全局版本和事务状态原子迁移到新数据库。旧 JSON 和 `userspaces/` 镜像保留但不再更新；它们不是当前备份，也不能用于回滚新版本的写入。迁移保留实际存储的 Key；客户端应移除为旧版重复解码添加的二次编码补丁。迁移失败会阻止启动，不会静默创建空库。升级前请停服并备份整个数据目录；升级后的离线备份应在停服后复制 `httpkvdb.db`，在线备份使用导出 API（仅包含当前 userspace 的 KV，不包含认证和事务状态）。
 
-文件后缀由 `Content-Type` 决定：`text/plain` 为 `.txt`，`application/json` 为 `.json`，`application/octet-stream` 为 `.bin`，其他类型无后缀。复杂 key 会被安全编码后落盘，不会直接作为路径使用。写入通过临时文件和原子 rename 持久化。生产部署时应把 `KVHTTP_STORAGE_PATH` 放在可靠的本地持久化存储上。
+相对存储路径以进程工作目录为基准；生产部署建议使用绝对路径，如 `/var/lib/httpkvdb`。导入总大小由 `KVHTTP_MAX_IMPORT_SIZE` 独立限制（默认 1 GiB，包含二进制格式开销），每条 Value 仍受 `KVHTTP_MAX_VALUE_SIZE` 限制。导入导出目前会在内存中缓冲整个数据集，应按可用内存配置上限。
+
+首次初始化后，bootstrap 配置不会重新添加已轮换或删除的认证信息；轮换管理员 APIKey 会保留其角色。修改 bootstrap 环境变量不是轮换 Key 的方式。
+
+事务片段累计 body 上限由 `KVHTTP_MAX_TX_BODY_SIZE` 控制，默认 256 MiB。`KVHTTP_TX_RESULT_RETENTION_MS` 控制终态片段 body 的保留期，不删除事务记录、哈希或完整结果，也不保证数据库文件缩小。没有条件写入或 CAS；`EXISTS` 不会阻止后续 PUT，应用侧的唯一性检查或读改写需要协调所有写入者。
+
+JWT 仅支持 HS256，要求已映射的 `sub` 和有效的 `exp`；服务没有 JWT 签发/登录接口。配置的 `iss` / `aud` 非空时才检查。API 的精确状态码、重试规则、路径编码与当前实现边界见 [GUIDE.md](GUIDE.md)；所有配置名、默认值及校验规则见 [docs/SPEC.md 第 19 节](docs/SPEC.md#19-配置项)。
 
 ## 安全检查清单
 

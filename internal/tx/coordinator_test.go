@@ -17,6 +17,7 @@ func newTestCoordinator(t *testing.T) (*Coordinator, *storage.Store, model.Princ
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = s.Close() })
 	p := model.Principal{UserID: "u1", UserspaceID: "space1"}
 	return NewCoordinator(s, &lock.Serializable{}, 1000, time.Second, time.Minute), s, p
 }

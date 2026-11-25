@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"math"
 	"time"
 
 	"httpkvdb/internal/model"
@@ -16,7 +17,15 @@ func Encode(records []model.KVRecord) ([]byte, error) {
 	_ = binary.Write(&body, binary.BigEndian, FormatVersion)
 	_ = binary.Write(&body, binary.BigEndian, time.Now().UTC().UnixMilli())
 	_ = binary.Write(&body, binary.BigEndian, uint64(len(records)))
+	keys := map[string]struct{}{}
 	for _, rec := range records {
+		if _, exists := keys[rec.Key]; exists {
+			return nil, ErrInvalidFormat
+		}
+		keys[rec.Key] = struct{}{}
+		if storage.ValidateKey(rec.Key, len(rec.Key)) != nil || uint64(len(rec.Key)) > math.MaxUint32 || storage.ValidateContentType(rec.ContentType) != nil {
+			return nil, ErrInvalidFormat
+		}
 		key := []byte(rec.Key)
 		ct := []byte(rec.ContentType)
 		_ = binary.Write(&body, binary.BigEndian, uint32(len(key)))

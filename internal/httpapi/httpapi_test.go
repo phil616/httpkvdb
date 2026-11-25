@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,18 +23,31 @@ import (
 )
 
 func newTestHTTP(t *testing.T, dir string) http.Handler {
+	h, _ := newTestHTTPStore(t, dir)
+	return h
+}
+
+func newTestHTTPStore(t *testing.T, dir string, configure ...func(*config.Config)) (http.Handler, *storage.Store) {
 	t.Helper()
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg.StoragePath = dir
 	cfg.MaxValueSize = 1 << 20
+	cfg.MaxImportSize = 4 << 20
 	cfg.MaxKeySize = 4096
 	cfg.MaxTxOps = 1000
 	cfg.DefaultTxTimeoutMS = 1000
 	cfg.MaxTxTimeoutMS = 10000
+	for _, apply := range configure {
+		apply(&cfg)
+	}
 	s, err := storage.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = s.Close() })
 	if err := s.UpsertAPIKeyHash(auth.APIKeyHash("key-a", "pepper"), model.Principal{UserID: "a", UserspaceID: "space-a"}); err != nil {
 		t.Fatal(err)
 	}
@@ -50,8 +62,9 @@ func newTestHTTP(t *testing.T, dir string) http.Handler {
 	}
 	serial := &lock.Serializable{}
 	authn := auth.New(s, "jwt-secret", "pepper", "", "", time.Minute, 100)
-	coord := httptx.NewCoordinator(s, serial, cfg.MaxTxOps, time.Second, 10*time.Second)
-	return NewServer(cfg, s, authn, serial, coord, &observe.Metrics{}).Handler()
+	metrics := &observe.Metrics{}
+	coord := httptx.NewCoordinator(s, serial, cfg.MaxTxOps, time.Second, 10*time.Second, httptx.Options{MaxBodySize: cfg.MaxTxBodySize, ResultRetention: time.Duration(cfg.TxResultRetentionMS) * time.Millisecond, Metrics: metrics})
+	return NewServer(cfg, s, authn, serial, coord, metrics).Handler(), s
 }
 
 func TestHTTPPutGetDeleteAndIsolation(t *testing.T) {
@@ -82,7 +95,7 @@ func TestHTTPInvalidJSONAndBinary(t *testing.T) {
 	}
 }
 
-func TestHTTPUserspacePathAPIKeyHeaderAndFileMirror(t *testing.T) {
+func TestHTTPUserspacePathAPIKeyHeaderAndContentTypes(t *testing.T) {
 	dir := t.TempDir()
 	h := newTestHTTP(t, dir)
 	doWithAPIKeyHeader(t, h, http.MethodPut, "/api/v1/alice/profile", "key-alice", "text/plain", []byte("Alice"), http.StatusOK)
@@ -90,17 +103,21 @@ func TestHTTPUserspacePathAPIKeyHeaderAndFileMirror(t *testing.T) {
 		t.Fatalf("userspace path get mismatch: %q", string(got))
 	}
 	doWithAPIKeyHeader(t, h, http.MethodGet, "/api/v1/space-b/profile", "key-alice", "", nil, http.StatusForbidden)
-	assertFile(t, dir+"/userspaces/alice/profile.txt", "Alice")
 
 	doWithAPIKeyHeader(t, h, http.MethodPut, "/api/v1/alice/profile", "key-alice", "application/json", []byte(`{"name":"Alice"}`), http.StatusOK)
-	assertMissing(t, dir+"/userspaces/alice/profile.txt")
-	assertFile(t, dir+"/userspaces/alice/profile.json", `{"name":"Alice"}`)
+	if got := do(t, h, http.MethodGet, "/api/v1/alice/profile", "key-alice", "", nil, http.StatusOK); string(got) != `{"name":"Alice"}` {
+		t.Fatal("JSON overwrite mismatch")
+	}
 
 	doWithAPIKeyHeader(t, h, http.MethodPut, "/api/v1/alice/avatar", "key-alice", "application/octet-stream", []byte{0, 1, 2}, http.StatusOK)
-	assertFileBytes(t, dir+"/userspaces/alice/avatar.bin", []byte{0, 1, 2})
+	if got := do(t, h, http.MethodGet, "/api/v1/alice/avatar", "key-alice", "", nil, http.StatusOK); !bytes.Equal(got, []byte{0, 1, 2}) {
+		t.Fatal("binary mismatch")
+	}
 
 	doWithAPIKeyHeader(t, h, http.MethodPut, "/api/v1/alice/mixed", "key-alice", "image/png", []byte{3, 4}, http.StatusOK)
-	assertFileBytes(t, dir+"/userspaces/alice/mixed", []byte{3, 4})
+	if got := do(t, h, http.MethodGet, "/api/v1/alice/mixed", "key-alice", "", nil, http.StatusOK); !bytes.Equal(got, []byte{3, 4}) {
+		t.Fatal("custom content type mismatch")
+	}
 }
 
 func TestHTTPAdminCreateUserspace(t *testing.T) {
@@ -198,8 +215,11 @@ func TestHTTPExportImportModes(t *testing.T) {
 
 func TestHTTPPersistenceAfterRestart(t *testing.T) {
 	dir := t.TempDir()
-	h := newTestHTTP(t, dir)
+	h, store := newTestHTTPStore(t, dir)
 	do(t, h, http.MethodPut, "/v1/kv/persist", "key-a", "text/plain", []byte("kept"), http.StatusOK)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
 	h = newTestHTTP(t, dir)
 	if got := do(t, h, http.MethodGet, "/v1/kv/persist", "key-a", "", nil, http.StatusOK); string(got) != "kept" {
 		t.Fatalf("persisted value mismatch: %q", string(got))
@@ -312,27 +332,4 @@ func doWithAPIKeyHeader(t *testing.T, h http.Handler, method, path, key, ct stri
 		t.Fatalf("%s %s got status %d want %d body=%s", method, path, rr.Code, want, rr.Body.String())
 	}
 	return rr.Body.Bytes()
-}
-
-func assertFile(t *testing.T, path, want string) {
-	t.Helper()
-	assertFileBytes(t, path, []byte(want))
-}
-
-func assertFileBytes(t *testing.T, path string, want []byte) {
-	t.Helper()
-	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("%s = %q want %q", path, string(got), string(want))
-	}
-}
-
-func assertMissing(t *testing.T, path string) {
-	t.Helper()
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("%s exists or stat failed with unexpected error: %v", path, err)
-	}
 }

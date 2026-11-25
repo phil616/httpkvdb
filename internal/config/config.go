@@ -3,9 +3,11 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -14,7 +16,9 @@ type Config struct {
 	CORSAllowedOrigins   string
 	MaxKeySize           int
 	MaxValueSize         int64
+	MaxImportSize        int64
 	MaxTxOps             int
+	MaxTxBodySize        int64
 	DefaultTxTimeoutMS   int
 	MaxTxTimeoutMS       int
 	TxCleanIntervalMS    int
@@ -30,14 +34,15 @@ type Config struct {
 	JWTAudience          string
 }
 
-func Load() Config {
+func Load() (Config, error) {
 	values := map[string]string{}
-	for _, key := range knownKeys {
-		if value := os.Getenv(key); value != "" {
+	for _, assignment := range os.Environ() {
+		key, value, _ := strings.Cut(assignment, "=")
+		if strings.HasPrefix(key, "KVHTTP_") {
 			values[key] = value
 		}
 	}
-	return fromValues(values)
+	return loadValues(values)
 }
 
 func LoadFromFile(path string) (Config, error) {
@@ -45,72 +50,126 @@ func LoadFromFile(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	return fromValues(values), nil
+	return loadValues(values)
 }
 
-var knownKeys = []string{
-	"KVHTTP_ADDR",
-	"KVHTTP_STORAGE_PATH",
-	"KVHTTP_CORS_ALLOWED_ORIGINS",
-	"KVHTTP_MAX_KEY_SIZE",
-	"KVHTTP_MAX_VALUE_SIZE",
-	"KVHTTP_MAX_TX_OPS",
-	"KVHTTP_DEFAULT_TX_TIMEOUT_MS",
-	"KVHTTP_MAX_TX_TIMEOUT_MS",
-	"KVHTTP_TX_CLEAN_INTERVAL_MS",
-	"KVHTTP_TX_RESULT_RETENTION_MS",
-	"KVHTTP_AUTH_CACHE_TTL_MS",
-	"KVHTTP_AUTH_CACHE_MAX_ENTRIES",
-	"KVHTTP_BOOTSTRAP_USER_ID",
-	"KVHTTP_BOOTSTRAP_USERSPACE_ID",
-	"KVHTTP_BOOTSTRAP_API_KEY",
-	"KVHTTP_API_KEY_PEPPER",
-	"KVHTTP_JWT_SECRET",
-	"KVHTTP_JWT_ISSUER",
-	"KVHTTP_JWT_AUDIENCE",
-}
-
-func fromValues(values map[string]string) Config {
+func defaults() Config {
 	return Config{
-		Addr:                 value(values, "KVHTTP_ADDR", "0.0.0.0:8080"),
-		StoragePath:          value(values, "KVHTTP_STORAGE_PATH", "./data"),
-		CORSAllowedOrigins:   value(values, "KVHTTP_CORS_ALLOWED_ORIGINS", "http://127.0.0.1:5173,http://localhost:5173"),
-		MaxKeySize:           valueInt(values, "KVHTTP_MAX_KEY_SIZE", 4096),
-		MaxValueSize:         int64(valueInt(values, "KVHTTP_MAX_VALUE_SIZE", 104857600)),
-		MaxTxOps:             valueInt(values, "KVHTTP_MAX_TX_OPS", 1000),
-		DefaultTxTimeoutMS:   valueInt(values, "KVHTTP_DEFAULT_TX_TIMEOUT_MS", 30000),
-		MaxTxTimeoutMS:       valueInt(values, "KVHTTP_MAX_TX_TIMEOUT_MS", 300000),
-		TxCleanIntervalMS:    valueInt(values, "KVHTTP_TX_CLEAN_INTERVAL_MS", 5000),
-		TxResultRetentionMS:  valueInt(values, "KVHTTP_TX_RESULT_RETENTION_MS", 3600000),
-		AuthCacheTTLMS:       valueInt(values, "KVHTTP_AUTH_CACHE_TTL_MS", 60000),
-		AuthCacheMaxEntries:  valueInt(values, "KVHTTP_AUTH_CACHE_MAX_ENTRIES", 10000),
-		BootstrapUserID:      value(values, "KVHTTP_BOOTSTRAP_USER_ID", "admin"),
-		BootstrapUserspaceID: value(values, "KVHTTP_BOOTSTRAP_USERSPACE_ID", "admin_space"),
-		BootstrapAPIKey:      value(values, "KVHTTP_BOOTSTRAP_API_KEY", "dev-secret-key"),
-		APIKeyPepper:         value(values, "KVHTTP_API_KEY_PEPPER", ""),
-		JWTSecret:            value(values, "KVHTTP_JWT_SECRET", "dev-jwt-secret"),
-		JWTIssuer:            value(values, "KVHTTP_JWT_ISSUER", ""),
-		JWTAudience:          value(values, "KVHTTP_JWT_AUDIENCE", ""),
+		Addr:                 "0.0.0.0:8080",
+		StoragePath:          "./data",
+		CORSAllowedOrigins:   "http://127.0.0.1:5173,http://localhost:5173",
+		MaxKeySize:           4096,
+		MaxValueSize:         104857600,
+		MaxImportSize:        1073741824,
+		MaxTxOps:             1000,
+		MaxTxBodySize:        268435456,
+		DefaultTxTimeoutMS:   30000,
+		MaxTxTimeoutMS:       300000,
+		TxCleanIntervalMS:    5000,
+		TxResultRetentionMS:  3600000,
+		AuthCacheTTLMS:       60000,
+		AuthCacheMaxEntries:  10000,
+		BootstrapUserID:      "admin",
+		BootstrapUserspaceID: "admin_space",
+		BootstrapAPIKey:      "dev-secret-key",
+		APIKeyPepper:         "",
+		JWTSecret:            "dev-jwt-secret",
+		JWTIssuer:            "",
+		JWTAudience:          "",
 	}
 }
 
-func value(values map[string]string, k, def string) string {
-	if v := values[k]; v != "" {
-		return v
+// Field pointers keep parsing types explicit and avoid inferring them from key names.
+func configFields(c *Config) map[string]any {
+	return map[string]any{
+		"KVHTTP_ADDR":                   &c.Addr,
+		"KVHTTP_STORAGE_PATH":           &c.StoragePath,
+		"KVHTTP_CORS_ALLOWED_ORIGINS":   &c.CORSAllowedOrigins,
+		"KVHTTP_MAX_KEY_SIZE":           &c.MaxKeySize,
+		"KVHTTP_MAX_VALUE_SIZE":         &c.MaxValueSize,
+		"KVHTTP_MAX_IMPORT_SIZE":        &c.MaxImportSize,
+		"KVHTTP_MAX_TX_OPS":             &c.MaxTxOps,
+		"KVHTTP_MAX_TX_BODY_SIZE":       &c.MaxTxBodySize,
+		"KVHTTP_DEFAULT_TX_TIMEOUT_MS":  &c.DefaultTxTimeoutMS,
+		"KVHTTP_MAX_TX_TIMEOUT_MS":      &c.MaxTxTimeoutMS,
+		"KVHTTP_TX_CLEAN_INTERVAL_MS":   &c.TxCleanIntervalMS,
+		"KVHTTP_TX_RESULT_RETENTION_MS": &c.TxResultRetentionMS,
+		"KVHTTP_AUTH_CACHE_TTL_MS":      &c.AuthCacheTTLMS,
+		"KVHTTP_AUTH_CACHE_MAX_ENTRIES": &c.AuthCacheMaxEntries,
+		"KVHTTP_BOOTSTRAP_USER_ID":      &c.BootstrapUserID,
+		"KVHTTP_BOOTSTRAP_USERSPACE_ID": &c.BootstrapUserspaceID,
+		"KVHTTP_BOOTSTRAP_API_KEY":      &c.BootstrapAPIKey,
+		"KVHTTP_API_KEY_PEPPER":         &c.APIKeyPepper,
+		"KVHTTP_JWT_SECRET":             &c.JWTSecret,
+		"KVHTTP_JWT_ISSUER":             &c.JWTIssuer,
+		"KVHTTP_JWT_AUDIENCE":           &c.JWTAudience,
 	}
-	return def
 }
 
-func valueInt(values map[string]string, k string, def int) int {
-	v := values[k]
-	if v == "" {
-		return def
+func loadValues(values map[string]string) (Config, error) {
+	cfg := defaults()
+	fields := configFields(&cfg)
+	for key, raw := range values {
+		field, known := fields[key]
+		if !known {
+			return Config{}, fmt.Errorf("unknown config key %q", key)
+		}
+		if raw == "" {
+			continue
+		} // Empty values use the documented default, including empty optional fields.
+		switch target := field.(type) {
+		case *string:
+			*target = raw
+		case *int:
+			parsed, err := strconv.Atoi(raw)
+			if err != nil {
+				return Config{}, fmt.Errorf("%s must be a decimal integer", key)
+			}
+			*target = parsed
+		case *int64:
+			parsed, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil {
+				return Config{}, fmt.Errorf("%s must be a decimal integer", key)
+			}
+			*target = parsed
+		}
 	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return def
+	return cfg, cfg.Validate()
+}
+
+// Validate prevents invalid limits and duration overflow from reaching storage or timers.
+func (c Config) Validate() error {
+	if c.MaxKeySize <= 0 || c.MaxKeySize > 32768 {
+		return fmt.Errorf("KVHTTP_MAX_KEY_SIZE must be between 1 and 32768 bytes")
 	}
-	return n
+	for _, item := range []struct {
+		name  string
+		value int64
+	}{
+		{"KVHTTP_MAX_VALUE_SIZE", c.MaxValueSize}, {"KVHTTP_MAX_IMPORT_SIZE", c.MaxImportSize},
+		{"KVHTTP_MAX_TX_BODY_SIZE", c.MaxTxBodySize}, {"KVHTTP_MAX_TX_OPS", int64(c.MaxTxOps)},
+		{"KVHTTP_AUTH_CACHE_MAX_ENTRIES", int64(c.AuthCacheMaxEntries)},
+	} {
+		if item.value <= 0 {
+			return fmt.Errorf("%s must be positive", item.name)
+		}
+	}
+	for _, item := range []struct {
+		name  string
+		value int
+	}{
+		{"KVHTTP_DEFAULT_TX_TIMEOUT_MS", c.DefaultTxTimeoutMS}, {"KVHTTP_MAX_TX_TIMEOUT_MS", c.MaxTxTimeoutMS},
+		{"KVHTTP_TX_CLEAN_INTERVAL_MS", c.TxCleanIntervalMS}, {"KVHTTP_TX_RESULT_RETENTION_MS", c.TxResultRetentionMS},
+		{"KVHTTP_AUTH_CACHE_TTL_MS", c.AuthCacheTTLMS},
+	} {
+		if item.value <= 0 || int64(item.value) > math.MaxInt64/int64(time.Millisecond) {
+			return fmt.Errorf("%s must be a positive millisecond duration within time.Duration range", item.name)
+		}
+	}
+	if c.DefaultTxTimeoutMS > c.MaxTxTimeoutMS {
+		return fmt.Errorf("KVHTTP_DEFAULT_TX_TIMEOUT_MS must not exceed KVHTTP_MAX_TX_TIMEOUT_MS")
+	}
+	return nil
 }
 
 func readEnvFile(path string) (map[string]string, error) {
@@ -138,7 +197,17 @@ func readEnvFile(path string) (map[string]string, error) {
 		if key == "" {
 			return nil, fmt.Errorf("invalid config line %d", lineNo)
 		}
-		values[key] = unquote(rawValue)
+		if _, known := configFields(&Config{})[key]; !known {
+			return nil, fmt.Errorf("unknown config key on line %d", lineNo)
+		}
+		if _, exists := values[key]; exists {
+			return nil, fmt.Errorf("duplicate config key on line %d", lineNo)
+		}
+		parsed, err := unquote(rawValue)
+		if err != nil {
+			return nil, fmt.Errorf("invalid quoted config value on line %d", lineNo)
+		}
+		values[key] = parsed
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
@@ -146,17 +215,18 @@ func readEnvFile(path string) (map[string]string, error) {
 	return values, nil
 }
 
-func unquote(value string) string {
-	if len(value) >= 2 {
-		first := value[0]
-		last := value[len(value)-1]
-		if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
-			unquoted, err := strconv.Unquote(value)
-			if err == nil {
-				return unquoted
-			}
-			return value[1 : len(value)-1]
-		}
+func unquote(value string) (string, error) {
+	if value == "" {
+		return "", nil
 	}
-	return value
+	if value[0] == '\'' {
+		if len(value) < 2 || value[len(value)-1] != '\'' {
+			return "", fmt.Errorf("unmatched single quote")
+		}
+		return value[1 : len(value)-1], nil
+	}
+	if value[0] == '"' {
+		return strconv.Unquote(value)
+	}
+	return value, nil
 }

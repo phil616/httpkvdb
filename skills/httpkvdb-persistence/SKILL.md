@@ -1,83 +1,32 @@
 ---
 name: httpkvdb-persistence
-description: Use this skill when building, modifying, testing, or migrating applications that use the httpkvdb project as a persistent store. It covers the actual HTTPKVDB API, key/value modeling, JSON/string/binary value handling, userspace authentication, transactions, import/export, test workflows, required developer inputs, and relational-schema-to-key-value migration methodology.
+description: Design, integrate, test, or migrate application persistence using HTTPKVDB's authenticated HTTP KV API. Use for key modeling, atomic multi-key writes, userspace setup, and relational-to-KV migration; not for SQL queries or direct edits to database files.
 ---
 
 # HTTPKVDB Persistence
 
-## Core Rules
+Treat HTTPKVDB as a single-node, globally serializable HTTP KV store. Ordinary CRUD is a single-operation transaction. Multi-request transaction fragments are persisted but do not execute until commit. The service has no conditional writes, compare-and-set, increments, joins, normal-user scans, or automatic indexes.
 
-Treat HTTPKVDB as a single-node, strongly consistent, authenticated HTTP key-value database.
+When modifying this repository, follow `docs/SPEC.md` and inspect the relevant handlers, storage, and tests. When integrating a different application, use the references below; do not assume that application contains HTTPKVDB's source paths. Confirm the deployed service's version/configuration when behavior or limits matter.
 
-Follow the project specification in `docs/SPEC.md` whenever working inside this repository. Do not invent SQL, tables, range scans, secondary indexes, MVCC, distributed behavior, or direct access to auth storage. Ordinary CRUD operations are single-operation serializable transactions. Multi-operation work must use the transaction API and must not execute transaction fragments before commit.
+Never log raw values, APIKeys, JWTs, or Authorization headers. Do not edit `httpkvdb.db`, the legacy JSON snapshot, or old mirrors to change application data. Use the authenticated API.
 
-Use `application/json` for structured values, `text/plain` for plain strings, and `application/octet-stream` for binary values. JSON writes must be valid JSON. Never log raw values, API keys, JWTs, or `Authorization` headers.
+## Choose the Relevant Reference
 
-## First Questions For The Human
+- [API reference](references/api-reference.md): routes, encoding, statuses, limits, authentication, and persistence/backup boundaries.
+- [Modeling and migration](references/modeling-and-migration.md): aggregate boundaries, explicit indexes, concurrency constraints, source-to-target mapping, and restore planning.
+- [Testing and validation](references/testing-and-validation.md): behavior tests, integration checks, and migration validation.
 
-Ask for missing information only when it affects correctness. For persistence design or migration work, request:
+## Inputs and Workflow
 
-- The entities or existing relational schema, including primary keys, unique constraints, foreign keys, nullable fields, and expected row counts.
-- Required access patterns: exact-key reads, lookup-by-field, list views, parent-child reads, uniqueness checks, deletes, exports, and restores.
-- Consistency boundaries: which records and indexes must change atomically.
-- Userspace/auth model: bootstrap admin, target userspaces, APIKey or JWT usage, and whether admin cross-userspace access is needed.
-- Value size and key size expectations.
-- Migration source, acceptable downtime, validation method, and rollback/export requirements.
+Use supplied information first. Ask for missing details only when they affect the task: the service origin and assigned userspace, credential method, source schema/entities, access patterns, expected sizes/counts, atomicity boundaries, or migration downtime/rollback requirements. Application name is a naming convention, not the authorization source. Do not infer permission to create userspaces, rotate credentials, delete data, or import in replace mode merely from possession of a credential.
 
-If the human already provided enough context, proceed with conservative assumptions and state them briefly.
+Design stable, versioned logical keys for exact lookups. Use JSON for structured aggregates, text/plain for strings, and application/octet-stream for bytes. Percent-encode the complete logical key once in both HTTP paths and `X-KV-Key`; literal percent signs inside modeled keys must also be encoded for transport.
 
-## Workflow
+Keep base records and their application-managed index/reference keys in one transaction when they must change atomically. Before claiming uniqueness or safe read-modify-write, account for the interval between reading and constructing the transaction: all participating writers need an application coordinator. EXISTS only reports presence; it does not assert a condition or cancel later PUTs. Do not promise that atomic multi-key writes alone enforce uniqueness, foreign keys, increments, or list updates.
 
-1. Read `docs/SPEC.md` and the relevant handlers before changing project behavior.
-2. Decide whether the task is direct CRUD integration, transaction design, admin/userspace setup, import/export, or relational-to-KV migration.
-3. Load the relevant reference:
-   - API calls and wire syntax: `references/api-reference.md`
-   - Data modeling and relational migration: `references/modeling-and-migration.md`
-   - Testing and delivery checklist: `references/testing-and-validation.md`
-4. Design stable key names before writing code. Keys are the schema.
-5. Use JSON documents for structured aggregates unless the value is naturally text or binary.
-6. Add explicit index keys for every non-primary-key lookup the application needs.
-7. Update base records and index keys in one HTTPKVDB transaction when they must stay consistent.
-8. Add or update tests for behavior changes. Run `go test ./...` before finishing repository changes.
+Submit stable seq/op IDs, then commit. A final fragment can auto-commit when commit arrived early; inspect its status even on HTTP 202. If a response is lost, query/retry the original transaction ID before considering a new business transaction. Do not turn uncertain outcomes into duplicate business actions.
 
-## Key Design Principles
+Back up the target before destructive migration. A userspace KV export excludes auth and transaction state; a full database backup requires a stopped service. Describe key templates, aggregate/index examples, concurrency protocol, write/delete boundaries, size limits, validation, and rollback only to the extent needed for the user's task.
 
-Prefer key templates that are stable, URL-encodable, and versioned:
-
-```text
-app/v1/{entity}/{id}
-app/v1/index/{entity}/{field}/{encoded_value}
-app/v1/ref/{parent_entity}/{parent_id}/{child_entity}
-```
-
-Keep keys non-empty UTF-8 strings and within the configured key-size limit. URL-encode keys when they appear in HTTP paths. Avoid making secrets, raw user input, or large payloads part of keys.
-
-Use one JSON value per aggregate when the application normally reads or writes the data together. Split records only when independent lifecycle, size, or access patterns require it.
-
-## Consistency Guidance
-
-Use ordinary `PUT`, `GET`, `HEAD`, and `DELETE` for single-key operations.
-
-Use transactions for:
-
-- Creating a record plus one or more index keys.
-- Updating a unique field and replacing its old index key.
-- Deleting a record plus all owned index keys.
-- Moving a child record between parents.
-- Any migration batch that must be all-or-nothing.
-
-Transaction fragments are submitted as stored operations. They are not executed until commit. Submit all fragments with stable `seq` values and unique `X-KV-Op-Id` values, then commit.
-
-## Human-Facing Output Expectations
-
-When proposing a persistence design, include:
-
-- Key templates.
-- Example JSON values.
-- Required index keys.
-- Transaction boundaries.
-- Read/write/delete flows.
-- Constraints enforced by HTTPKVDB versus constraints enforced by application code.
-- Tests to add.
-
-When implementing code, keep changes scoped to the project patterns, do not bypass the global serializable lock, and do not add unsupported query semantics unless explicitly requested and covered by tests/spec changes.
+For repository changes, add/update behavior tests and run `go test ./...`. Keep the API examples, configuration template, and affected skill references synchronized with implemented behavior. Preserve the single global serializable lock and native atomic commit of KV plus transaction result.

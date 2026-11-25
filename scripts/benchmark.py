@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 httpkvdb benchmark — measures what actually matters for a globally
-serialised, snapshot-persisting KV store.
+serialised, transaction-persisting KV store.
 
 Reports latency distribution (P50/P95/P99/P99.9), dataset-size scaling,
 concurrency scaling, mixed-workload tail latency, and value-size impact.

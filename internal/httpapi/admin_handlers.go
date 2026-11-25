@@ -3,7 +3,6 @@ package httpapi
 import (
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
@@ -39,14 +38,13 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request, rawPath str
 	case strings.HasPrefix(rawPath, "userspaces/"):
 		s.handleAdminUserspace(w, r, strings.TrimPrefix(rawPath, "userspaces/"))
 	default:
-		http.NotFound(w, r)
+		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "route not found")
 	}
 }
 
 func (s *Server) handleCreateUserspace(w http.ResponseWriter, r *http.Request) {
 	var req createUserspaceRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		writeError(w, r, http.StatusBadRequest, "BAD_REQUEST", "invalid json")
+	if !readJSONObject(w, r, &req, false) {
 		return
 	}
 	if req.UserID == "" {
@@ -104,7 +102,7 @@ func (s *Server) handleAdminUserspace(w http.ResponseWriter, r *http.Request, ra
 	case strings.HasPrefix(rest, "kv/"):
 		s.handleAdminKV(w, r, userspaceID, strings.TrimPrefix(rest, "kv/"))
 	default:
-		http.NotFound(w, r)
+		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "route not found")
 	}
 }
 
@@ -176,7 +174,8 @@ func (s *Server) handleAdminKV(w http.ResponseWriter, r *http.Request, userspace
 	case http.MethodDelete:
 		s.handleDelete(w, r, userspaceID, key)
 	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Header().Set("Allow", "GET, HEAD, PUT, DELETE")
+		writeError(w, r, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 	}
 }
 

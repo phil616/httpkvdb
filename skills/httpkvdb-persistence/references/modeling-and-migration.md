@@ -39,7 +39,7 @@ app/v1/index/users/email/alice%40example.com
 app/v1/ref/users/u_1001/orders
 ```
 
-Do not put raw secrets in keys. Keep key segments bounded. Encode arbitrary external values before placing them in path-like keys.
+Do not put raw secrets in keys. Keep key segments bounded. Segment encoding inside a logical key is an application convention; the server sees a flat string. When the logical key already contains `%40`, transport encoding must encode that `%` as `%25`. Do not confuse modeling an encoded segment with encoding the complete key for the HTTP path or X-KV-Key header.
 
 ## Value Design
 
@@ -81,7 +81,7 @@ Map relational concepts explicitly:
 | Primary key | ID segment in the key |
 | Composite primary key | Multiple key segments |
 | Column | JSON field |
-| Unique index | Explicit index key maintained transactionally |
+| Unique index | Explicit index key plus application coordination across all writers; atomic writes alone do not enforce uniqueness |
 | Non-unique index | Explicit list/set/index records maintained by application |
 | Foreign key | Stored target ID plus application validation |
 | Join | Multiple exact-key reads or denormalized document |
@@ -152,9 +152,15 @@ For high-churn lists, split list buckets to avoid repeatedly rewriting very larg
 app/v1/ref/users/u_1001/orders/2026-06
 ```
 
-Because there is no conditional put in the current project, strict uniqueness is an application protocol: read the index, decide, then write base record and index in a transaction. If concurrent creators can race for the same unique key, add an application-level coordinator or extend HTTPKVDB with tested conditional operations before claiming hard uniqueness.
+When splitting lists into buckets, supply a manifest or a deterministic bucket mapping that clients can enumerate without a range scan.
+
+There is no conditional put, compare-and-set, increment, or branching on transaction reads. Strict uniqueness requires an application coordinator covering every participating writer and spanning the check through confirmed commit. Reading the index outside a transaction and later writing it is unsafe without this coordinator. An EXISTS operation only reports presence and never prevents a later PUT. Base and index writes in the same transaction guarantee atomic visibility, not uniqueness by themselves.
+
+The same rule applies to counters, updating JSON lists, and changing an indexed field based on a previous read: concurrent read/compute/write flows can lose updates. A single-process mutex is insufficient when other processes can write the same keys. If a tested conditional-operation extension is required, treat it as a separate server feature request, not an existing capability.
 
 ## Write Flows
+
+The flows below require the application coordinator to cover the entire flow, including pre-reads and recovery from an uncertain commit. Otherwise they are only safe with a single writer and do not enforce concurrent invariants.
 
 Create record with unique index:
 
@@ -167,7 +173,7 @@ Create record with unique index:
 6. Commit.
 ```
 
-Update indexed field:
+Update indexed field (skip index changes when the field is unchanged):
 
 ```text
 1. GET current base record.
@@ -198,16 +204,18 @@ Delete record:
 3. Define key templates and JSON schemas for each aggregate.
 4. Define required index and reference keys.
 5. Define transaction boundaries for create, update, delete, and migration batches.
-6. Write an idempotent migration plan:
+6. Back up the target before replacing data. A userspace export covers only KV; stop the server and copy httpkvdb.db when auth and transaction state must also be recoverable. Plan downtime or coordinate all writers so validation counts are meaningful.
+7. Write an idempotent migration plan:
    - Read source rows in deterministic order.
    - Transform rows into base KV records.
    - Generate index/reference records.
    - Write through HTTP API or import format, not by mutating storage files directly.
-7. Validate:
+8. Validate:
    - Count source rows versus generated base records.
    - Verify required indexes resolve to existing base records.
    - Sample read paths that the application will use.
-   - Export after import for rollback/archive.
+   - Export after import for validation/archive; this is not a pre-migration rollback copy.
+   - Import assigns new versions and updated_at timestamps; compare content/checksums, not equality of original version numbers.
 
 ## What Not To Do
 
@@ -217,4 +225,4 @@ Do not depend on lexicographic key scans; this project does not expose range-sca
 
 Do not store application records in the system auth space.
 
-Do not bypass the transaction API for multi-key invariants.
+Use transactions for each atomic invariant group or an atomic userspace import for a coordinated bulk restore. Respect per-value, total import, transaction operation-count, and accumulated transaction body limits.

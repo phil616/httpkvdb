@@ -1,18 +1,16 @@
 package storage
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
+	"runtime"
 	"sort"
-	"strings"
-	"sync"
 	"time"
 
+	bolt "go.etcd.io/bbolt"
 	"httpkvdb/internal/model"
 )
 
@@ -20,6 +18,13 @@ var (
 	ErrNotFound      = errors.New("not found")
 	ErrTxNotFound    = errors.New("tx not found")
 	ErrAlreadyExists = errors.New("already exists")
+	metaBucket       = []byte("meta")
+	spacesBucket     = []byte("kv")
+	apiKeysBucket    = []byte("system:api_keys")
+	subjectsBucket   = []byte("system:jwt_subjects")
+	txsBucket        = []byte("tx:states")
+	schemaKey        = []byte("schema")
+	bootstrapKey     = []byte("bootstrapped")
 )
 
 type APIKeyRecord struct {
@@ -27,13 +32,11 @@ type APIKeyRecord struct {
 	Principal model.Principal `json:"principal"`
 	Active    bool            `json:"active"`
 }
-
 type JWTSubjectRecord struct {
 	Subject   string          `json:"subject"`
 	Principal model.Principal `json:"principal"`
 	Active    bool            `json:"active"`
 }
-
 type UserspaceInfo struct {
 	UserspaceID string `json:"userspace_id"`
 	UserID      string `json:"user_id"`
@@ -41,6 +44,7 @@ type UserspaceInfo struct {
 	APIKeyCount int    `json:"api_key_count"`
 }
 
+// snapshot is the legacy JSON format, read only during the first migration.
 type snapshot struct {
 	Version     uint64                               `json:"version"`
 	Userspaces  map[string]map[string]model.KVRecord `json:"userspaces"`
@@ -49,60 +53,235 @@ type snapshot struct {
 	Txs         map[string]model.Transaction         `json:"txs"`
 }
 
-type Store struct {
-	mu   sync.Mutex
-	path string
-	data snapshot
-}
+type Store struct{ db *bolt.DB }
 
-var safeFileSegmentPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
-
+// Open takes an exclusive process lock. Keys and userspaces are database keys,
+// never filesystem paths. Default bbolt commits synchronously flush to disk.
 func Open(path string) (*Store, error) {
-	if err := os.MkdirAll(path, 0o700); err != nil {
+	dir, err := filepath.Abs(path)
+	if err != nil {
 		return nil, err
 	}
-	s := &Store{path: filepath.Join(path, "httpkvdb.json")}
-	if err := s.load(); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
+	}
+	dbPath := filepath.Join(dir, "httpkvdb.db")
+	if info, err := os.Stat(dbPath); err == nil && info.Size() == 0 {
+		return nil, errors.New("empty database file")
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	db, err := bolt.Open(dbPath, 0600, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		return nil, err
+	}
+	s := &Store{db: db}
+	if err := db.Update(func(tx *bolt.Tx) error { return initialize(tx, dir) }); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	// Flush the directory entry of the database as well as its contents.
+	// Windows does not support syncing directories through os.File.Sync.
+	if runtime.GOOS != "windows" {
+		directory, err := os.Open(dir)
+		if err == nil {
+			err = directory.Sync()
+			closeErr := directory.Close()
+			if err == nil {
+				err = closeErr
+			}
+		}
+		if err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
 	return s, nil
 }
 
-func (s *Store) Bootstrap(userID, userspaceID, apiKeyHash string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ensureMaps(&s.data)
-	changed := false
-	if s.data.Userspaces[userspaceID] == nil {
-		s.data.Userspaces[userspaceID] = map[string]model.KVRecord{}
-		changed = true
+func (s *Store) Close() error { return s.db.Close() }
+
+func initialize(tx *bolt.Tx, dir string) error {
+	names := [][]byte{metaBucket, spacesBucket, apiKeysBucket, subjectsBucket, txsBucket}
+	if meta := tx.Bucket(metaBucket); meta != nil && meta.Get(schemaKey) != nil {
+		if string(meta.Get(schemaKey)) != "1" {
+			return errors.New("unsupported storage schema")
+		}
+		for _, name := range names {
+			if tx.Bucket(name) == nil {
+				return errors.New("incomplete database")
+			}
+		}
+		return nil
 	}
-	if apiKeyHash != "" {
-		if _, ok := s.data.APIKeys[apiKeyHash]; !ok {
-			p := model.Principal{UserID: userID, UserspaceID: userspaceID, Roles: []string{"admin"}, AuthMethod: "apikey"}
-			s.data.APIKeys[apiKeyHash] = APIKeyRecord{Hash: apiKeyHash, Principal: p, Active: true}
-			changed = true
+	// A prior failed initialization leaves an empty root, since initialization is
+	// atomic. Nonempty unmarked files cannot safely be treated as a new store.
+	cursor := tx.Cursor()
+	if first, _ := cursor.First(); first != nil {
+		return errors.New("unrecognized database schema")
+	}
+	for _, name := range names {
+		if _, err := tx.CreateBucket(name); err != nil {
+			return err
 		}
 	}
-	if _, ok := s.data.JWTSubjects[userID]; !ok {
-		p := model.Principal{UserID: userID, UserspaceID: userspaceID, Roles: []string{"admin"}, AuthMethod: "jwt"}
-		s.data.JWTSubjects[userID] = JWTSubjectRecord{Subject: userID, Principal: p, Active: true}
-		changed = true
+	meta := tx.Bucket(metaBucket)
+	data, err := os.ReadFile(filepath.Join(dir, "httpkvdb.json"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
-	if changed {
-		return s.persistLocked()
+	if err == nil {
+		var old snapshot
+		// Empty/truncated legacy files must not silently become an empty database.
+		if err := json.Unmarshal(data, &old); err != nil {
+			return fmt.Errorf("invalid legacy database: %w", err)
+		}
+		if len(data) == 0 || string(data) == "null" || old.Userspaces == nil || old.APIKeys == nil || old.JWTSubjects == nil || old.Txs == nil {
+			return errors.New("incomplete legacy database")
+		}
+		for space, records := range old.Userspaces {
+			b, err := tx.Bucket(spacesBucket).CreateBucketIfNotExists([]byte(space))
+			if err != nil {
+				return err
+			}
+			for key, record := range records {
+				if err := putJSON(b, key, record); err != nil {
+					return err
+				}
+			}
+		}
+		for key, record := range old.APIKeys {
+			if err := putJSON(tx.Bucket(apiKeysBucket), key, record); err != nil {
+				return err
+			}
+		}
+		for key, record := range old.JWTSubjects {
+			if err := putJSON(tx.Bucket(subjectsBucket), key, record); err != nil {
+				return err
+			}
+		}
+		for key, record := range old.Txs {
+			if err := putJSON(tx.Bucket(txsBucket), key, record); err != nil {
+				return err
+			}
+		}
+		if err := meta.SetSequence(old.Version); err != nil {
+			return err
+		}
 	}
-	return nil
+	// Existing credentials are authoritative, including keys rotated before migration.
+	if tx.Bucket(apiKeysBucket).Stats().KeyN > 0 || tx.Bucket(subjectsBucket).Stats().KeyN > 0 {
+		if err := meta.Put(bootstrapKey, []byte{1}); err != nil {
+			return err
+		}
+	}
+	return meta.Put(schemaKey, []byte("1"))
+}
+
+func putJSON(b *bolt.Bucket, key string, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return b.Put([]byte(key), data)
+}
+
+func (s *Store) Bootstrap(userID, userspaceID, apiKeyHash string) error {
+	if err := ValidateUserspaceID(userspaceID); err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		meta := tx.Bucket(metaBucket)
+		if meta.Get(bootstrapKey) != nil {
+			return nil
+		}
+		if tx.Bucket(apiKeysBucket).Stats().KeyN == 0 && tx.Bucket(subjectsBucket).Stats().KeyN == 0 {
+			if _, err := tx.Bucket(spacesBucket).CreateBucketIfNotExists([]byte(userspaceID)); err != nil {
+				return err
+			}
+			p := model.Principal{UserID: userID, UserspaceID: userspaceID, Roles: []string{"admin"}, AuthMethod: "apikey"}
+			if apiKeyHash != "" {
+				if err := putJSON(tx.Bucket(apiKeysBucket), apiKeyHash, APIKeyRecord{Hash: apiKeyHash, Principal: p, Active: true}); err != nil {
+					return err
+				}
+			}
+			p.AuthMethod = "jwt"
+			if err := putJSON(tx.Bucket(subjectsBucket), userID, JWTSubjectRecord{Subject: userID, Principal: p, Active: true}); err != nil {
+				return err
+			}
+		}
+		return meta.Put(bootstrapKey, []byte{1})
+	})
 }
 
 func (s *Store) UpsertAPIKeyHash(hash string, p model.Principal) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	p.AuthMethod = "apikey"
-	s.data.APIKeys[hash] = APIKeyRecord{Hash: hash, Principal: p, Active: true}
-	return s.persistLocked()
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return putJSON(tx.Bucket(apiKeysBucket), hash, APIKeyRecord{Hash: hash, Principal: p, Active: true})
+	})
+}
+func (s *Store) UpsertJWTSubject(subject string, p model.Principal) error {
+	p.AuthMethod = "jwt"
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return putJSON(tx.Bucket(subjectsBucket), subject, JWTSubjectRecord{Subject: subject, Principal: p, Active: true})
+	})
 }
 
+func userspaceInfos(tx *bolt.Tx) (map[string]UserspaceInfo, error) {
+	infos := map[string]UserspaceInfo{}
+	err := tx.Bucket(spacesBucket).ForEach(func(k, v []byte) error {
+		if v == nil {
+			infos[string(k)] = UserspaceInfo{UserspaceID: string(k), UserID: string(k), KeyCount: tx.Bucket(spacesBucket).Bucket(k).Stats().KeyN}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	err = tx.Bucket(subjectsBucket).ForEach(func(_, v []byte) error {
+		var record JWTSubjectRecord
+		if err := json.Unmarshal(v, &record); err != nil {
+			return err
+		}
+		p := record.Principal
+		info := infos[p.UserspaceID]
+		info.UserspaceID = p.UserspaceID
+		if info.UserID == "" || info.UserID == info.UserspaceID {
+			info.UserID = p.UserID
+		}
+		infos[p.UserspaceID] = info
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	err = tx.Bucket(apiKeysBucket).ForEach(func(_, v []byte) error {
+		var record APIKeyRecord
+		if err := json.Unmarshal(v, &record); err != nil {
+			return err
+		}
+		p := record.Principal
+		info := infos[p.UserspaceID]
+		info.UserspaceID = p.UserspaceID
+		if info.UserID == "" || info.UserID == info.UserspaceID {
+			info.UserID = p.UserID
+		}
+		if record.Active {
+			info.APIKeyCount++
+		}
+		infos[p.UserspaceID] = info
+		return nil
+	})
+	return infos, err
+}
+func userspaceExists(tx *bolt.Tx, id string) (bool, error) {
+	if tx.Bucket(spacesBucket).Bucket([]byte(id)) != nil {
+		return true, nil
+	}
+	infos, err := userspaceInfos(tx)
+	_, ok := infos[id]
+	return ok, err
+}
 func (s *Store) CreateUserspace(userspaceID, userID, apiKeyHash string) error {
 	if err := ValidateUserspaceID(userspaceID); err != nil {
 		return err
@@ -110,527 +289,437 @@ func (s *Store) CreateUserspace(userspaceID, userID, apiKeyHash string) error {
 	if userID == "" {
 		userID = userspaceID
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ensureMaps(&s.data)
-	if userspaceExistsLocked(&s.data, userspaceID) {
-		return ErrAlreadyExists
-	}
-	s.data.Userspaces[userspaceID] = map[string]model.KVRecord{}
-	if apiKeyHash != "" {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		exists, err := userspaceExists(tx, userspaceID)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return ErrAlreadyExists
+		}
+		if _, err := tx.Bucket(spacesBucket).CreateBucket([]byte(userspaceID)); err != nil {
+			return err
+		}
+		if apiKeyHash == "" {
+			return nil
+		}
+		if tx.Bucket(apiKeysBucket).Get([]byte(apiKeyHash)) != nil {
+			return ErrAlreadyExists
+		}
 		p := model.Principal{UserID: userID, UserspaceID: userspaceID, Roles: []string{"user"}, AuthMethod: "apikey"}
-		s.data.APIKeys[apiKeyHash] = APIKeyRecord{Hash: apiKeyHash, Principal: p, Active: true}
-	}
-	return s.persistLocked()
+		return putJSON(tx.Bucket(apiKeysBucket), apiKeyHash, APIKeyRecord{Hash: apiKeyHash, Principal: p, Active: true})
+	})
 }
-
 func (s *Store) ListUserspaces() ([]UserspaceInfo, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ensureMaps(&s.data)
-	infos := map[string]UserspaceInfo{}
-	for userspaceID, records := range s.data.Userspaces {
-		infos[userspaceID] = UserspaceInfo{UserspaceID: userspaceID, UserID: userspaceID, KeyCount: len(records)}
-	}
-	for _, rec := range s.data.APIKeys {
-		if !rec.Active {
-			continue
+	out := []UserspaceInfo{}
+	err := s.db.View(func(tx *bolt.Tx) error {
+		infos, err := userspaceInfos(tx)
+		if err != nil {
+			return err
 		}
-		info := infos[rec.Principal.UserspaceID]
-		if info.UserspaceID == "" {
-			info.UserspaceID = rec.Principal.UserspaceID
-			info.KeyCount = len(s.data.Userspaces[rec.Principal.UserspaceID])
+		for _, info := range infos {
+			out = append(out, info)
 		}
-		if info.UserID == "" || info.UserID == info.UserspaceID {
-			info.UserID = rec.Principal.UserID
-		}
-		info.APIKeyCount++
-		infos[info.UserspaceID] = info
-	}
-	out := make([]UserspaceInfo, 0, len(infos))
-	for _, info := range infos {
-		out = append(out, info)
-	}
+		return nil
+	})
 	sort.Slice(out, func(i, j int) bool { return out[i].UserspaceID < out[j].UserspaceID })
-	return out, nil
+	return out, err
 }
-
+func deleteMatching(b *bolt.Bucket, match func([]byte) (bool, error)) error {
+	// Collect keys before modifying the bucket during iteration.
+	var keys [][]byte
+	if err := b.ForEach(func(k, v []byte) error {
+		ok, err := match(v)
+		if ok {
+			keys = append(keys, append([]byte(nil), k...))
+		}
+		return err
+	}); err != nil {
+		return err
+	}
+	for _, k := range keys {
+		if err := b.Delete(k); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 func (s *Store) DeleteUserspace(userspaceID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ensureMaps(&s.data)
-	if !userspaceExistsLocked(&s.data, userspaceID) {
-		return ErrNotFound
-	}
-	delete(s.data.Userspaces, userspaceID)
-	for hash, rec := range s.data.APIKeys {
-		if rec.Principal.UserspaceID == userspaceID {
-			delete(s.data.APIKeys, hash)
+	return s.db.Update(func(tx *bolt.Tx) error {
+		exists, err := userspaceExists(tx, userspaceID)
+		if err != nil {
+			return err
 		}
-	}
-	for subject, rec := range s.data.JWTSubjects {
-		if rec.Principal.UserspaceID == userspaceID {
-			delete(s.data.JWTSubjects, subject)
+		if !exists {
+			return ErrNotFound
 		}
-	}
-	for txID, tx := range s.data.Txs {
-		if tx.UserspaceID == userspaceID {
-			delete(s.data.Txs, txID)
-		}
-	}
-	return s.persistLocked()
-}
-
-func (s *Store) ReplaceUserspaceAPIKeyHash(userspaceID, apiKeyHash string) (model.Principal, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ensureMaps(&s.data)
-	if !userspaceExistsLocked(&s.data, userspaceID) {
-		return model.Principal{}, ErrNotFound
-	}
-	if s.data.Userspaces[userspaceID] == nil {
-		s.data.Userspaces[userspaceID] = map[string]model.KVRecord{}
-	}
-	userID := userspaceID
-	for hash, rec := range s.data.APIKeys {
-		if rec.Principal.UserspaceID == userspaceID {
-			if rec.Principal.UserID != "" {
-				userID = rec.Principal.UserID
+		spaces := tx.Bucket(spacesBucket)
+		if spaces.Bucket([]byte(userspaceID)) != nil {
+			if err := spaces.DeleteBucket([]byte(userspaceID)); err != nil {
+				return err
 			}
-			delete(s.data.APIKeys, hash)
 		}
-	}
-	p := model.Principal{UserID: userID, UserspaceID: userspaceID, Roles: []string{"user"}, AuthMethod: "apikey"}
-	s.data.APIKeys[apiKeyHash] = APIKeyRecord{Hash: apiKeyHash, Principal: p, Active: true}
-	return p, s.persistLocked()
-}
-
-func (s *Store) ListUserspaceKeys(userspaceID string) ([]model.KVRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	space, ok := s.data.Userspaces[userspaceID]
-	if !ok && !userspaceExistsLocked(&s.data, userspaceID) {
-		return nil, ErrNotFound
-	}
-	records := make([]model.KVRecord, 0, len(space))
-	for _, rec := range space {
-		cp := cloneRecord(rec)
-		cp.Value = nil
-		records = append(records, cp)
-	}
-	sort.Slice(records, func(i, j int) bool { return records[i].Key < records[j].Key })
-	return records, nil
-}
-
-func userspaceExistsLocked(d *snapshot, userspaceID string) bool {
-	if _, ok := d.Userspaces[userspaceID]; ok {
-		return true
-	}
-	for _, rec := range d.APIKeys {
-		if rec.Principal.UserspaceID == userspaceID {
-			return true
+		// All persisted objects expose their ownership through userspace_id.
+		for _, name := range [][]byte{apiKeysBucket, subjectsBucket} {
+			if err := deleteMatching(tx.Bucket(name), func(v []byte) (bool, error) {
+				var record struct {
+					Principal model.Principal `json:"principal"`
+				}
+				err := json.Unmarshal(v, &record)
+				return record.Principal.UserspaceID == userspaceID, err
+			}); err != nil {
+				return err
+			}
 		}
-	}
-	for _, rec := range d.JWTSubjects {
-		if rec.Principal.UserspaceID == userspaceID {
-			return true
+		return deleteMatching(tx.Bucket(txsBucket), func(v []byte) (bool, error) {
+			var record model.Transaction
+			err := json.Unmarshal(v, &record)
+			return record.UserspaceID == userspaceID, err
+		})
+	})
+}
+func (s *Store) ReplaceUserspaceAPIKeyHash(userspaceID, hash string) (model.Principal, error) {
+	var p model.Principal
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		exists, err := userspaceExists(tx, userspaceID)
+		if err != nil {
+			return err
 		}
+		if !exists {
+			return ErrNotFound
+		}
+		if tx.Bucket(apiKeysBucket).Get([]byte(hash)) != nil {
+			return ErrAlreadyExists
+		}
+		p = model.Principal{UserID: userspaceID, UserspaceID: userspaceID, Roles: []string{"user"}, AuthMethod: "apikey"}
+		found := false
+		if err := deleteMatching(tx.Bucket(apiKeysBucket), func(v []byte) (bool, error) {
+			var record APIKeyRecord
+			err := json.Unmarshal(v, &record)
+			match := record.Principal.UserspaceID == userspaceID
+			if match && !found {
+				p = record.Principal
+				found = true
+			}
+			return match, err
+		}); err != nil {
+			return err
+		}
+		if !found {
+			if err := tx.Bucket(subjectsBucket).ForEach(func(_, v []byte) error {
+				var record JWTSubjectRecord
+				if err := json.Unmarshal(v, &record); err != nil {
+					return err
+				}
+				if record.Principal.UserspaceID == userspaceID && !found {
+					p = record.Principal
+					found = true
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		p.AuthMethod = "apikey"
+		return putJSON(tx.Bucket(apiKeysBucket), hash, APIKeyRecord{Hash: hash, Principal: p, Active: true})
+	})
+	if err != nil {
+		return model.Principal{}, err
 	}
-	return false
+	return p, nil
 }
 
-func (s *Store) UpsertJWTSubject(subject string, p model.Principal) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	p.AuthMethod = "jwt"
-	s.data.JWTSubjects[subject] = JWTSubjectRecord{Subject: subject, Principal: p, Active: true}
-	return s.persistLocked()
+func getRecord(tx *bolt.Tx, userspaceID, key string) (model.KVRecord, error) {
+	b := tx.Bucket(spacesBucket).Bucket([]byte(userspaceID))
+	if b == nil {
+		return model.KVRecord{}, ErrNotFound
+	}
+	data := b.Get([]byte(key))
+	if data == nil {
+		return model.KVRecord{}, ErrNotFound
+	}
+	var record model.KVRecord
+	err := json.Unmarshal(data, &record)
+	return record, err
 }
-
 func (s *Store) Get(userspaceID, key string) (model.KVRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return getFrom(&s.data, userspaceID, key)
+	var record model.KVRecord
+	err := s.db.View(func(tx *bolt.Tx) error { var err error; record, err = getRecord(tx, userspaceID, key); return err })
+	return record, err
 }
-
 func (s *Store) Put(userspaceID, key string, value []byte, contentType string) (uint64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rec := putInto(&s.data, userspaceID, key, value, contentType)
-	return rec.Version, s.persistLocked()
-}
-
-func (s *Store) Delete(userspaceID, key string) (uint64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, err := getFrom(&s.data, userspaceID, key); err != nil {
+	var version uint64
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		record, err := putRecord(tx, userspaceID, key, value, contentType)
+		version = record.Version
+		return err
+	})
+	if err != nil {
 		return 0, err
 	}
-	s.data.Version++
-	delete(s.data.Userspaces[userspaceID], key)
-	return s.data.Version, s.persistLocked()
+	return version, nil
 }
-
+func putRecord(tx *bolt.Tx, userspaceID, key string, value []byte, contentType string) (model.KVRecord, error) {
+	b, err := tx.Bucket(spacesBucket).CreateBucketIfNotExists([]byte(userspaceID))
+	if err != nil {
+		return model.KVRecord{}, err
+	}
+	now := time.Now().UTC()
+	created := now
+	old, err := getRecord(tx, userspaceID, key)
+	if err == nil {
+		created = old.CreatedAt
+	} else if !errors.Is(err, ErrNotFound) {
+		return model.KVRecord{}, err
+	}
+	version, err := tx.Bucket(metaBucket).NextSequence()
+	if err != nil {
+		return model.KVRecord{}, err
+	}
+	record := model.KVRecord{UserspaceID: userspaceID, Key: key, Value: value, ContentType: contentType, ValueType: ValueType(contentType), Version: version, CreatedAt: created, UpdatedAt: now, Checksum: Checksum(value)}
+	if err := putJSON(b, key, record); err != nil {
+		return model.KVRecord{}, err
+	}
+	record.Value = append([]byte(nil), value...)
+	return record, nil
+}
+func deleteRecord(tx *bolt.Tx, userspaceID, key string) (uint64, error) {
+	if _, err := getRecord(tx, userspaceID, key); err != nil {
+		return 0, err
+	}
+	version, err := tx.Bucket(metaBucket).NextSequence()
+	if err != nil {
+		return 0, err
+	}
+	return version, tx.Bucket(spacesBucket).Bucket([]byte(userspaceID)).Delete([]byte(key))
+}
+func (s *Store) Delete(userspaceID, key string) (uint64, error) {
+	var version uint64
+	err := s.db.Update(func(tx *bolt.Tx) error { var err error; version, err = deleteRecord(tx, userspaceID, key); return err })
+	if err != nil {
+		return 0, err
+	}
+	return version, nil
+}
 func (s *Store) Exists(userspaceID, key string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, err := getFrom(&s.data, userspaceID, key)
+	_, err := s.Get(userspaceID, key)
 	return err == nil
 }
-
-func (s *Store) ExportUserspace(userspaceID string) ([]model.KVRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var records []model.KVRecord
-	for _, rec := range s.data.Userspaces[userspaceID] {
-		records = append(records, cloneRecord(rec))
+func recordsIn(tx *bolt.Tx, userspaceID string, metadataOnly bool) ([]model.KVRecord, error) {
+	records := []model.KVRecord{}
+	b := tx.Bucket(spacesBucket).Bucket([]byte(userspaceID))
+	if b == nil {
+		return records, nil
 	}
-	sort.Slice(records, func(i, j int) bool { return records[i].Key < records[j].Key })
-	return records, nil
+	err := b.ForEach(func(_, v []byte) error {
+		var record model.KVRecord
+		if err := json.Unmarshal(v, &record); err != nil {
+			return err
+		}
+		if metadataOnly {
+			record.Value = nil
+		}
+		records = append(records, record)
+		return nil
+	})
+	return records, err
+}
+func (s *Store) ExportUserspace(userspaceID string) ([]model.KVRecord, error) {
+	var records []model.KVRecord
+	err := s.db.View(func(tx *bolt.Tx) error { var err error; records, err = recordsIn(tx, userspaceID, false); return err })
+	return records, err
+}
+func (s *Store) ListUserspaceKeys(userspaceID string) ([]model.KVRecord, error) {
+	var records []model.KVRecord
+	err := s.db.View(func(tx *bolt.Tx) error {
+		exists, err := userspaceExists(tx, userspaceID)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return ErrNotFound
+		}
+		records, err = recordsIn(tx, userspaceID, true)
+		return err
+	})
+	return records, err
+}
+func (s *Store) ResolveAPIKeyHash(hash string) (model.Principal, bool) {
+	var record APIKeyRecord
+	err := s.db.View(func(tx *bolt.Tx) error {
+		data := tx.Bucket(apiKeysBucket).Get([]byte(hash))
+		if data == nil {
+			return ErrNotFound
+		}
+		return json.Unmarshal(data, &record)
+	})
+	record.Principal.AuthMethod = "apikey"
+	return record.Principal, err == nil && record.Active
+}
+func (s *Store) ResolveJWTSubject(subject string) (model.Principal, bool) {
+	var record JWTSubjectRecord
+	err := s.db.View(func(tx *bolt.Tx) error {
+		data := tx.Bucket(subjectsBucket).Get([]byte(subject))
+		if data == nil {
+			return ErrNotFound
+		}
+		return json.Unmarshal(data, &record)
+	})
+	record.Principal.AuthMethod = "jwt"
+	return record.Principal, err == nil && record.Active
+}
+func (s *Store) SaveTx(record model.Transaction) error {
+	return s.db.Update(func(tx *bolt.Tx) error { return putJSON(tx.Bucket(txsBucket), record.TxID, record) })
+}
+func (s *Store) GetTx(id string) (model.Transaction, error) {
+	var record model.Transaction
+	err := s.db.View(func(tx *bolt.Tx) error {
+		data := tx.Bucket(txsBucket).Get([]byte(id))
+		if data == nil {
+			return ErrTxNotFound
+		}
+		return json.Unmarshal(data, &record)
+	})
+	return record, err
+}
+func (s *Store) ListTxs() ([]model.Transaction, error) {
+	records := []model.Transaction{}
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(txsBucket).ForEach(func(_, v []byte) error {
+			var record model.Transaction
+			if err := json.Unmarshal(v, &record); err != nil {
+				return err
+			}
+			records = append(records, record)
+			return nil
+		})
+	})
+	return records, err
+}
+func (s *Store) Ready() error {
+	return s.db.View(func(tx *bolt.Tx) error {
+		for _, name := range [][]byte{metaBucket, spacesBucket, apiKeysBucket, subjectsBucket, txsBucket} {
+			if tx.Bucket(name) == nil {
+				return errors.New("storage unavailable")
+			}
+		}
+		if string(tx.Bucket(metaBucket).Get(schemaKey)) != "1" {
+			return errors.New("unsupported storage schema")
+		}
+		return nil
+	})
 }
 
+// AtomicTx is one native writable transaction; KV changes and the final result
+// are committed together. Callers must commit or roll back exactly once.
+type AtomicTx struct {
+	tx   *bolt.Tx
+	err  error
+	done bool
+}
+
+func (s *Store) BeginAtomic() (*AtomicTx, error) {
+	tx, err := s.db.Begin(true)
+	if err != nil {
+		return nil, err
+	}
+	return &AtomicTx{tx: tx}, nil
+}
+func (tx *AtomicTx) Get(userspaceID, key string) (model.KVRecord, error) {
+	return getRecord(tx.tx, userspaceID, key)
+}
+func (tx *AtomicTx) Put(userspaceID, key string, value []byte, contentType string) (model.KVRecord, error) {
+	return putRecord(tx.tx, userspaceID, key, value, contentType)
+}
+func (tx *AtomicTx) Delete(userspaceID, key string) (uint64, error) {
+	return deleteRecord(tx.tx, userspaceID, key)
+}
+func (tx *AtomicTx) Exists(userspaceID, key string) bool {
+	_, err := tx.Get(userspaceID, key)
+	return err == nil
+}
+func (tx *AtomicTx) SaveTx(record model.Transaction) {
+	if tx.err == nil {
+		tx.err = putJSON(tx.tx.Bucket(txsBucket), record.TxID, record)
+	}
+}
+func (tx *AtomicTx) Commit() error {
+	if tx.done {
+		return bolt.ErrTxClosed
+	}
+	tx.done = true
+	if tx.err != nil {
+		_ = tx.tx.Rollback()
+		return tx.err
+	}
+	return tx.tx.Commit()
+}
+func (tx *AtomicTx) Rollback() {
+	if !tx.done {
+		tx.done = true
+		_ = tx.tx.Rollback()
+	}
+}
+func (tx *AtomicTx) ImportUserspace(userspaceID string, records []model.KVRecord, mode model.ImportMode) model.ImportResult {
+	result, err := tx.importRecords(userspaceID, records, mode)
+	if tx.err == nil {
+		tx.err = err
+	}
+	return result
+}
+func (tx *AtomicTx) importRecords(userspaceID string, records []model.KVRecord, mode model.ImportMode) (model.ImportResult, error) {
+	result := model.ImportResult{}
+	if mode != model.ImportReplace && mode != model.ImportMergeOverwrite && mode != model.ImportMergeSkip {
+		return result, errors.New("invalid import mode")
+	}
+	spaces := tx.tx.Bucket(spacesBucket)
+	if mode == model.ImportReplace && spaces.Bucket([]byte(userspaceID)) != nil {
+		if err := spaces.DeleteBucket([]byte(userspaceID)); err != nil {
+			return result, err
+		}
+	}
+	b, err := spaces.CreateBucketIfNotExists([]byte(userspaceID))
+	if err != nil {
+		return result, err
+	}
+	for _, record := range records {
+		exists := b.Get([]byte(record.Key)) != nil
+		if exists && mode == model.ImportMergeSkip {
+			result.Skipped++
+			continue
+		}
+		if exists {
+			result.Replaced++
+		}
+		version, err := tx.tx.Bucket(metaBucket).NextSequence()
+		if err != nil {
+			return result, err
+		}
+		now := time.Now().UTC()
+		record.UserspaceID = userspaceID
+		record.Version = version
+		if record.CreatedAt.IsZero() {
+			record.CreatedAt = now
+		}
+		record.UpdatedAt = now
+		record.Checksum = Checksum(record.Value)
+		record.ValueType = ValueType(record.ContentType)
+		if err := putJSON(b, record.Key, record); err != nil {
+			return result, err
+		}
+		result.Imported++
+	}
+	return result, nil
+}
 func (s *Store) ImportUserspace(userspaceID string, records []model.KVRecord, mode model.ImportMode) (model.ImportResult, error) {
 	tx, err := s.BeginAtomic()
 	if err != nil {
 		return model.ImportResult{}, err
 	}
-	res := tx.ImportUserspace(userspaceID, records, mode)
+	defer tx.Rollback()
+	result := tx.ImportUserspace(userspaceID, records, mode)
 	if err := tx.Commit(); err != nil {
 		return model.ImportResult{}, err
 	}
-	return res, nil
-}
-
-func (s *Store) ResolveAPIKeyHash(hash string) (model.Principal, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rec, ok := s.data.APIKeys[hash]
-	if !ok || !rec.Active {
-		return model.Principal{}, false
-	}
-	p := rec.Principal
-	p.AuthMethod = "apikey"
-	return p, true
-}
-
-func (s *Store) ResolveJWTSubject(subject string) (model.Principal, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rec, ok := s.data.JWTSubjects[subject]
-	if !ok || !rec.Active {
-		return model.Principal{}, false
-	}
-	p := rec.Principal
-	p.AuthMethod = "jwt"
-	return p, true
-}
-
-func (s *Store) SaveTx(tx model.Transaction) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.data.Txs[tx.TxID] = cloneTx(tx)
-	return s.persistLocked()
-}
-
-func (s *Store) GetTx(txID string) (model.Transaction, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	tx, ok := s.data.Txs[txID]
-	if !ok {
-		return model.Transaction{}, ErrTxNotFound
-	}
-	return cloneTx(tx), nil
-}
-
-func (s *Store) ListTxs() ([]model.Transaction, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]model.Transaction, 0, len(s.data.Txs))
-	for _, tx := range s.data.Txs {
-		out = append(out, cloneTx(tx))
-	}
-	return out, nil
-}
-
-func (s *Store) BeginAtomic() (*AtomicTx, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	cp, err := cloneSnapshot(s.data)
-	if err != nil {
-		return nil, err
-	}
-	return &AtomicTx{store: s, data: cp}, nil
-}
-
-type AtomicTx struct {
-	store *Store
-	data  snapshot
-	done  bool
-}
-
-func (tx *AtomicTx) Get(userspaceID, key string) (model.KVRecord, error) {
-	return getFrom(&tx.data, userspaceID, key)
-}
-
-func (tx *AtomicTx) Put(userspaceID, key string, value []byte, contentType string) (model.KVRecord, error) {
-	return putInto(&tx.data, userspaceID, key, value, contentType), nil
-}
-
-func (tx *AtomicTx) Delete(userspaceID, key string) (uint64, error) {
-	if _, err := getFrom(&tx.data, userspaceID, key); err != nil {
-		return 0, err
-	}
-	tx.data.Version++
-	delete(tx.data.Userspaces[userspaceID], key)
-	return tx.data.Version, nil
-}
-
-func (tx *AtomicTx) Exists(userspaceID, key string) bool {
-	_, err := getFrom(&tx.data, userspaceID, key)
-	return err == nil
-}
-
-func (tx *AtomicTx) ImportUserspace(userspaceID string, records []model.KVRecord, mode model.ImportMode) model.ImportResult {
-	if tx.data.Userspaces == nil {
-		tx.data.Userspaces = map[string]map[string]model.KVRecord{}
-	}
-	if mode == model.ImportReplace {
-		tx.data.Userspaces[userspaceID] = map[string]model.KVRecord{}
-	}
-	if tx.data.Userspaces[userspaceID] == nil {
-		tx.data.Userspaces[userspaceID] = map[string]model.KVRecord{}
-	}
-	res := model.ImportResult{}
-	for _, in := range records {
-		_, exists := tx.data.Userspaces[userspaceID][in.Key]
-		if exists && mode == model.ImportMergeSkip {
-			res.Skipped++
-			continue
-		}
-		if exists {
-			res.Replaced++
-		}
-		tx.data.Version++
-		now := time.Now().UTC()
-		rec := cloneRecord(in)
-		rec.UserspaceID = userspaceID
-		rec.Version = tx.data.Version
-		if rec.CreatedAt.IsZero() {
-			rec.CreatedAt = now
-		}
-		rec.UpdatedAt = now
-		rec.Checksum = Checksum(rec.Value)
-		rec.ValueType = ValueType(rec.ContentType)
-		tx.data.Userspaces[userspaceID][rec.Key] = rec
-		res.Imported++
-	}
-	return res
-}
-
-func (tx *AtomicTx) SaveTx(t model.Transaction) {
-	tx.data.Txs[t.TxID] = cloneTx(t)
-}
-
-func (tx *AtomicTx) Commit() error {
-	if tx.done {
-		return errors.New("atomic tx already closed")
-	}
-	tx.store.mu.Lock()
-	defer tx.store.mu.Unlock()
-	tx.store.data = tx.data
-	tx.done = true
-	return tx.store.persistLocked()
-}
-
-func (tx *AtomicTx) Rollback() {
-	tx.done = true
-}
-
-func (s *Store) load() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.data = snapshot{
-		Userspaces:  map[string]map[string]model.KVRecord{},
-		APIKeys:     map[string]APIKeyRecord{},
-		JWTSubjects: map[string]JWTSubjectRecord{},
-		Txs:         map[string]model.Transaction{},
-	}
-	b, err := os.ReadFile(s.path)
-	if errors.Is(err, os.ErrNotExist) {
-		return s.persistLocked()
-	}
-	if err != nil {
-		return err
-	}
-	if len(b) == 0 {
-		return nil
-	}
-	if err := json.Unmarshal(b, &s.data); err != nil {
-		return err
-	}
-	ensureMaps(&s.data)
-	return nil
-}
-
-func (s *Store) persistLocked() error {
-	ensureMaps(&s.data)
-	b, err := json.MarshalIndent(s.data, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		return err
-	}
-	return s.syncUserspaceFilesLocked()
-}
-
-func (s *Store) syncUserspaceFilesLocked() error {
-	root := filepath.Join(filepath.Dir(s.path), "userspaces")
-	if err := os.RemoveAll(root); err != nil {
-		return err
-	}
-	for userspaceID, records := range s.data.Userspaces {
-		dir := filepath.Join(root, safeUserspaceDir(userspaceID))
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
-		for key, rec := range records {
-			name := valueFileName(key, rec.ContentType)
-			if err := os.WriteFile(filepath.Join(dir, name), rec.Value, 0o600); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func safeUserspaceDir(userspaceID string) string {
-	if ValidateUserspaceID(userspaceID) == nil {
-		return userspaceID
-	}
-	return "u_" + base64.RawURLEncoding.EncodeToString([]byte(userspaceID))
-}
-
-func valueFileName(key, contentType string) string {
-	name := key
-	if key == "." || key == ".." || !safeFileSegmentPattern.MatchString(key) {
-		name = "k_" + base64.RawURLEncoding.EncodeToString([]byte(key))
-	}
-	return name + valueFileExtension(contentType)
-}
-
-func valueFileExtension(contentType string) string {
-	ct := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
-	switch ct {
-	case "text/plain":
-		return ".txt"
-	case "application/json":
-		return ".json"
-	case "application/octet-stream":
-		return ".bin"
-	default:
-		return ""
-	}
-}
-
-func ensureMaps(d *snapshot) {
-	if d.Userspaces == nil {
-		d.Userspaces = map[string]map[string]model.KVRecord{}
-	}
-	if d.APIKeys == nil {
-		d.APIKeys = map[string]APIKeyRecord{}
-	}
-	if d.JWTSubjects == nil {
-		d.JWTSubjects = map[string]JWTSubjectRecord{}
-	}
-	if d.Txs == nil {
-		d.Txs = map[string]model.Transaction{}
-	}
-}
-
-func getFrom(d *snapshot, userspaceID, key string) (model.KVRecord, error) {
-	space := d.Userspaces[userspaceID]
-	if space == nil {
-		return model.KVRecord{}, ErrNotFound
-	}
-	rec, ok := space[key]
-	if !ok {
-		return model.KVRecord{}, ErrNotFound
-	}
-	return cloneRecord(rec), nil
-}
-
-func putInto(d *snapshot, userspaceID, key string, value []byte, contentType string) model.KVRecord {
-	ensureMaps(d)
-	if d.Userspaces[userspaceID] == nil {
-		d.Userspaces[userspaceID] = map[string]model.KVRecord{}
-	}
-	now := time.Now().UTC()
-	created := now
-	if old, ok := d.Userspaces[userspaceID][key]; ok {
-		created = old.CreatedAt
-	}
-	d.Version++
-	rec := model.KVRecord{
-		UserspaceID: userspaceID,
-		Key:         key,
-		Value:       append([]byte(nil), value...),
-		ContentType: contentType,
-		ValueType:   ValueType(contentType),
-		Version:     d.Version,
-		CreatedAt:   created,
-		UpdatedAt:   now,
-		Checksum:    Checksum(value),
-	}
-	d.Userspaces[userspaceID][key] = rec
-	return cloneRecord(rec)
-}
-
-func cloneSnapshot(in snapshot) (snapshot, error) {
-	b, err := json.Marshal(in)
-	if err != nil {
-		return snapshot{}, err
-	}
-	var out snapshot
-	if err := json.Unmarshal(b, &out); err != nil {
-		return snapshot{}, err
-	}
-	ensureMaps(&out)
-	return out, nil
-}
-
-func cloneRecord(rec model.KVRecord) model.KVRecord {
-	rec.Value = append([]byte(nil), rec.Value...)
-	return rec
-}
-
-func cloneTx(tx model.Transaction) model.Transaction {
-	if tx.Ops == nil {
-		tx.Ops = map[int]model.TxOperation{}
-	}
-	cp := tx
-	cp.Ops = make(map[int]model.TxOperation, len(tx.Ops))
-	for k, op := range tx.Ops {
-		op.Body = append([]byte(nil), op.Body...)
-		cp.Ops[k] = op
-	}
-	if tx.Result != nil {
-		r := *tx.Result
-		r.Results = append([]model.TxOperationResult(nil), tx.Result.Results...)
-		cp.Result = &r
-	}
-	return cp
-}
-
-func (s *Store) Ready() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.path == "" {
-		return fmt.Errorf("storage path unavailable")
-	}
-	return nil
+	return result, nil
 }

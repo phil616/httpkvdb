@@ -10,7 +10,7 @@
 - 普通 `PUT` / `GET` / `HEAD` / `DELETE` 是单操作可串行化事务。
 - 普通 CRUD、事务提交、导入、导出都会经过全局串行化锁。
 - 事务片段在 commit 前只持久化，不提前执行。
-- 每个认证身份映射到独立 userspace；`/api/v1/{userspace}/{key}` 会校验 URL userspace 与认证结果一致。
+- 每个认证 Principal 映射到一个 userspace，多个凭据可以共享该空间；`/api/v1/{userspace}/{key}` 会校验 URL userspace 与认证结果一致。
 - APIKey 只保存 HMAC-SHA256 摘要，不保存明文。
 - 日志不得包含 APIKey、JWT、`Authorization` Header 或原始 value。
 
@@ -117,7 +117,7 @@ KVHTTP_JWT_SECRET=<required>
 
 - Go 1.22+ 源码兼容；首选工具链见 `go.mod`
 - Node.js/npm 用于 Web 管理端
-- Python 3.11+ 和 `uv` 用于生产风格测试脚本
+- Python 3.11+ 标准库用于生产风格测试脚本，`uv` 可选
 
 运行后端测试：
 
@@ -154,9 +154,9 @@ npm run build
 
 ## HTTP API 快速参考
 
-所有认证 API 都使用 `/v1` 前缀。
+认证 API 使用 `/v1/*`；用户空间 KV 路径使用 `/api/v1/{userspace}/{key}`。
 
-认证：
+认证（以下四种方式任选其一，不能同时发送多种或重复 Header）：
 
 ```http
 Authorization: ApiKey <api_key>
@@ -220,17 +220,23 @@ GET /metrics
 
 ## 存储
 
-当前存储后端会在 `KVHTTP_STORAGE_PATH` 下写入一个 JSON 快照文件，并同步生成按 userspace 分组的 KV 文件镜像：
+存储使用本地嵌入式事务数据库 [bbolt](https://github.com/etcd-io/bbolt/tree/v1.3.11)，数据目录由 `KVHTTP_STORAGE_PATH` 指定：
 
 ```text
-<storage-path>/httpkvdb.json
-<storage-path>/userspaces/{userspace}/{key}.txt
-<storage-path>/userspaces/{userspace}/{key}.json
-<storage-path>/userspaces/{userspace}/{key}.bin
-<storage-path>/userspaces/{userspace}/{key}
+<storage-path>/httpkvdb.db
 ```
 
-文件后缀由 `Content-Type` 决定：`text/plain` 为 `.txt`，`application/json` 为 `.json`，`application/octet-stream` 为 `.bin`，其他类型无后缀。复杂 key 会被安全编码后落盘，不会直接作为路径使用。写入通过临时文件和原子 rename 持久化。生产部署时应使用可靠的本地持久化存储。
+用户 KV、APIKey 摘要、JWT subject、事务片段和结果使用独立 bucket。写入使用同步持久化的原子事务；KV 更新与事务结果一起提交。Key 只作为数据库键保存，不转换为文件名，支持默认上限 4096 字节的 Key。数据库文件有独占锁，同一目录不能同时启动第二个实例。
+
+首次打开旧数据目录时，会将 `httpkvdb.json` 中的 KV、认证、全局版本和事务状态原子迁移到新数据库。旧 JSON 和 `userspaces/` 镜像保留但不再更新；它们不是当前备份，也不能用于回滚新版本的写入。迁移保留实际存储的 Key；客户端应移除为旧版重复解码添加的二次编码补丁。迁移失败会阻止启动，不会静默创建空库。升级前请停服并备份整个数据目录；升级后的离线备份应在停服后复制 `httpkvdb.db`，在线备份使用导出 API（仅包含当前 userspace 的 KV，不包含认证和事务状态）。
+
+相对存储路径以进程工作目录为基准；生产部署建议使用绝对路径，如 `/var/lib/httpkvdb`。导入总大小由 `KVHTTP_MAX_IMPORT_SIZE` 独立限制（默认 1 GiB，包含二进制格式开销），每条 Value 仍受 `KVHTTP_MAX_VALUE_SIZE` 限制。导入导出目前会在内存中缓冲整个数据集，应按可用内存配置上限。
+
+首次初始化后，bootstrap 配置不会重新添加已轮换或删除的认证信息；轮换管理员 APIKey 会保留其角色。修改 bootstrap 环境变量不是轮换 Key 的方式。
+
+事务片段累计 body 上限由 `KVHTTP_MAX_TX_BODY_SIZE` 控制，默认 256 MiB。`KVHTTP_TX_RESULT_RETENTION_MS` 控制终态片段 body 的保留期，不删除事务记录、哈希或完整结果，也不保证数据库文件缩小。没有条件写入或 CAS；`EXISTS` 不会阻止后续 PUT，应用侧的唯一性检查或读改写需要协调所有写入者。
+
+JWT 仅支持 HS256，要求已映射的 `sub` 和有效的 `exp`；服务没有 JWT 签发/登录接口。配置的 `iss` / `aud` 非空时才检查。API 的精确状态码、重试规则、路径编码与当前实现边界见 [GUIDE.md](GUIDE.md)；所有配置名、默认值及校验规则见 [docs/SPEC.md 第 19 节](docs/SPEC.md#19-配置项)。
 
 ## 测试
 
@@ -244,7 +250,7 @@ go test ./...
 
 ```bash
 go build -trimpath -ldflags='-s -w' -o bin/kvhttpd ./cmd/kvhttpd
-uv run python scripts/production_test.py --binary ./bin/kvhttpd --port 18080
+python3 scripts/production_test.py --binary ./bin/kvhttpd --port 18080
 ```
 
-测试还会验证 `/api/v1/{userspace}/{key}`、`APIKey` Header、管理员创建 userspace 以及 userspace 文件镜像。测试报告不会打印 APIKey、`Authorization` Header 或原始 value。
+测试还会验证 `/api/v1/{userspace}/{key}`、`APIKey` Header、管理员创建 userspace 以及特殊字符和长 Key 的访问。测试报告不会打印 APIKey、`Authorization` Header 或原始 value。

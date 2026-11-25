@@ -33,6 +33,7 @@ type Authenticator struct {
 	max          int
 	mu           sync.Mutex
 	cache        map[string]cacheEntry
+	generation   uint64
 }
 
 type cacheEntry struct {
@@ -70,6 +71,7 @@ func (a *Authenticator) Invalidate() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.cache = map[string]cacheEntry{}
+	a.generation++
 }
 
 type principalKey struct{}
@@ -90,45 +92,49 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 	})
 }
 
+// Requests carry one credential source. Reject duplicates instead of silently
+// choosing a different principal based on header precedence.
 func (a *Authenticator) AuthenticateRequest(r *http.Request) (model.Principal, error) {
-	if key := strings.TrimSpace(r.Header.Get("APIKey")); key != "" {
-		return a.authenticateAPIKey(key)
+	credential := ""
+	method := ""
+	for _, name := range []string{"APIKey", "X-API-Key", "Authorization"} {
+		values := r.Header.Values(name)
+		if len(values) > 1 {
+			return model.Principal{}, ErrUnauthorized
+		}
+		value := strings.TrimSpace(r.Header.Get(name))
+		if value == "" {
+			continue
+		}
+		if credential != "" {
+			return model.Principal{}, ErrUnauthorized
+		}
+		credential = value
+		method = name
 	}
-	if key := strings.TrimSpace(r.Header.Get("X-API-Key")); key != "" {
-		return a.authenticateAPIKey(key)
+	if method == "APIKey" || method == "X-API-Key" {
+		return a.authenticateAPIKey(credential)
 	}
-	return a.Authenticate(r.Header.Get("Authorization"))
+	return a.Authenticate(credential)
 }
 
 func (a *Authenticator) Authenticate(header string) (model.Principal, error) {
-	if header == "" {
+	scheme, credential, ok := strings.Cut(strings.TrimSpace(header), " ")
+	credential = strings.TrimSpace(credential)
+	if !ok || credential == "" {
 		return model.Principal{}, ErrUnauthorized
 	}
-	if strings.HasPrefix(header, "ApiKey ") {
-		key := strings.TrimSpace(strings.TrimPrefix(header, "ApiKey "))
-		if key == "" {
-			return model.Principal{}, ErrUnauthorized
-		}
-		return a.authenticateAPIKey(key)
+	if strings.EqualFold(scheme, "ApiKey") {
+		return a.authenticateAPIKey(credential)
 	}
-	if strings.HasPrefix(header, "Bearer ") {
-		token := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
-		sub, err := a.verifyJWT(token)
-		if err != nil {
-			return model.Principal{}, ErrUnauthorized
-		}
-		if p, ok := a.getCache("jwt:" + sub); ok {
-			return p, nil
-		}
-		p, ok := a.store.ResolveJWTSubject(sub)
-		if !ok {
-			return model.Principal{}, ErrUnauthorized
-		}
-		p.AuthMethod = "jwt"
-		a.setCache("jwt:"+sub, p)
-		return p, nil
+	if !strings.EqualFold(scheme, "Bearer") {
+		return model.Principal{}, ErrUnauthorized
 	}
-	return model.Principal{}, ErrUnauthorized
+	sub, err := a.verifyJWT(credential)
+	if err != nil {
+		return model.Principal{}, ErrUnauthorized
+	}
+	return a.resolveCached("jwt:"+sub, "jwt", func() (model.Principal, bool) { return a.store.ResolveJWTSubject(sub) })
 }
 
 func (a *Authenticator) authenticateAPIKey(key string) (model.Principal, error) {
@@ -136,38 +142,40 @@ func (a *Authenticator) authenticateAPIKey(key string) (model.Principal, error) 
 		return model.Principal{}, ErrUnauthorized
 	}
 	hash := APIKeyHash(key, a.apiKeyPepper)
-	if p, ok := a.getCache("apikey:" + hash); ok {
-		return p, nil
-	}
-	p, ok := a.store.ResolveAPIKeyHash(hash)
-	if !ok {
-		return model.Principal{}, ErrUnauthorized
-	}
-	a.setCache("apikey:"+hash, p)
-	return p, nil
+	return a.resolveCached("apikey:"+hash, "apikey", func() (model.Principal, bool) { return a.store.ResolveAPIKeyHash(hash) })
 }
 
-func (a *Authenticator) getCache(k string) (model.Principal, bool) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	ent, ok := a.cache[k]
-	if !ok || time.Now().After(ent.expires) {
-		delete(a.cache, k)
-		return model.Principal{}, false
-	}
-	return ent.principal, true
-}
-
-func (a *Authenticator) setCache(k string, p model.Principal) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.max > 0 && len(a.cache) >= a.max {
-		for old := range a.cache {
-			delete(a.cache, old)
-			break
+func (a *Authenticator) resolveCached(key, method string, resolve func() (model.Principal, bool)) (model.Principal, error) {
+	for {
+		a.mu.Lock()
+		if entry, ok := a.cache[key]; ok && time.Now().Before(entry.expires) {
+			a.mu.Unlock()
+			return entry.principal, nil
 		}
+		delete(a.cache, key)
+		generation := a.generation
+		a.mu.Unlock()
+		principal, ok := resolve()
+		a.mu.Lock()
+		if generation != a.generation {
+			a.mu.Unlock()
+			continue
+		}
+		if !ok {
+			a.mu.Unlock()
+			return model.Principal{}, ErrUnauthorized
+		}
+		principal.AuthMethod = method
+		if a.max > 0 && len(a.cache) >= a.max {
+			for old := range a.cache {
+				delete(a.cache, old)
+				break
+			}
+		}
+		a.cache[key] = cacheEntry{principal: principal, expires: time.Now().Add(a.ttl)}
+		a.mu.Unlock()
+		return principal, nil
 	}
-	a.cache[k] = cacheEntry{principal: p, expires: time.Now().Add(a.ttl)}
 }
 
 type jwtClaims struct {
@@ -181,6 +189,17 @@ type jwtClaims struct {
 func (a *Authenticator) verifyJWT(token string) (string, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 || a.jwtSecret == "" {
+		return "", ErrUnauthorized
+	}
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return "", ErrUnauthorized
+	}
+	var header struct {
+		Algorithm string   `json:"alg"`
+		Critical  []string `json:"crit"`
+	}
+	if json.Unmarshal(headerBytes, &header) != nil || header.Algorithm != "HS256" || len(header.Critical) > 0 {
 		return "", ErrUnauthorized
 	}
 	signed := parts[0] + "." + parts[1]
@@ -200,7 +219,7 @@ func (a *Authenticator) verifyJWT(token string) (string, error) {
 		return "", ErrUnauthorized
 	}
 	now := time.Now().Unix()
-	if claims.Subject == "" || (claims.ExpiresAt != 0 && now >= claims.ExpiresAt) || (claims.NotBefore != 0 && now < claims.NotBefore) {
+	if claims.Subject == "" || (claims.ExpiresAt <= 0 || now >= claims.ExpiresAt) || (claims.NotBefore != 0 && now < claims.NotBefore) {
 		return "", ErrUnauthorized
 	}
 	if a.issuer != "" && claims.Issuer != a.issuer {
@@ -229,7 +248,7 @@ func audienceMatches(v any, want string) bool {
 func writeAuthError(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnauthorized)
-	_, _ = w.Write([]byte(`{"error":"UNAUTHORIZED","message":"unauthorized","request_id":"` + RequestID(r) + `"}`))
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": "UNAUTHORIZED", "message": "unauthorized", "request_id": RequestID(r)})
 }
 
 func RequestID(r *http.Request) string {

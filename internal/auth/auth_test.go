@@ -17,6 +17,7 @@ func TestAPIKeyHashAuthAndCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = s.Close() })
 	hash := APIKeyHash("secret", "pepper")
 	p := model.Principal{UserID: "u1", UserspaceID: "space1"}
 	if err := s.UpsertAPIKeyHash(hash, p); err != nil {
@@ -30,6 +31,9 @@ func TestAPIKeyHashAuthAndCache(t *testing.T) {
 	if got.UserID != "u1" || got.UserspaceID != "space1" || got.AuthMethod != "apikey" {
 		t.Fatalf("bad principal: %+v", got)
 	}
+	if _, err := a.Authenticate("apikey secret"); err != nil {
+		t.Fatal("case-insensitive auth scheme rejected", err)
+	}
 	if _, err := a.Authenticate("ApiKey wrong"); err != ErrUnauthorized {
 		t.Fatalf("expected unauthorized, got %v", err)
 	}
@@ -40,6 +44,7 @@ func TestJWTSubjectMapping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = s.Close() })
 	if err := s.UpsertJWTSubject("sub1", model.Principal{UserID: "u1", UserspaceID: "space1"}); err != nil {
 		t.Fatal(err)
 	}

@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import shutil
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -79,8 +80,7 @@ class Client:
             status = e.code
             resp_headers = dict(e.headers)
         if expected is not None and status != expected:
-            safe_payload = payload[:300].decode("utf-8", errors="replace")
-            raise AssertionError(f"status {status}, expected {expected}, response={safe_payload}")
+            raise AssertionError(f"status {status}, expected {expected}, response_bytes={len(payload)}")
         return status, resp_headers, payload
 
 
@@ -146,7 +146,7 @@ def main():
     if not os.path.exists(binary):
         raise SystemExit(f"binary does not exist: {binary}")
 
-    api_key = "local-prod-test-key-20260429"
+    api_key = secrets.token_urlsafe(32)
     data_dir = tempfile.mkdtemp(prefix="httpkvdb-prodtest-")
     base_url = f"http://127.0.0.1:{args.port}"
     report = Report(started_at=datetime.now(timezone.utc).isoformat(), binary=binary, base_url=base_url)
@@ -164,7 +164,7 @@ def main():
 
         run_check(report, "unauthenticated request rejected", lambda: unauthenticated_check(base_url))
         run_check(report, "json kv put/get/head/delete", lambda: kv_json_check(client))
-        run_check(report, "userspace url api and file mirror", lambda: userspace_url_and_file_mirror_check(client, data_dir))
+        run_check(report, "userspace URL and persistent database", lambda: userspace_url_check(client, data_dir))
         run_check(report, "admin creates userspace api key", lambda: admin_create_userspace_check(client, base_url, data_dir))
         run_check(report, "invalid json rejected", lambda: invalid_json_check(client))
         run_check(report, "binary value round trip", lambda: binary_check(client))
@@ -216,20 +216,22 @@ def kv_json_check(client):
     return "json CRUD, metadata headers, strict delete verified"
 
 
-def userspace_url_and_file_mirror_check(client, data_dir):
+def userspace_url_check(client, data_dir):
     client.request("PUT", "/api/v1/prod_space/profile", b"Alice", content_type="text/plain", expected=200, auth_header="APIKey")
     _, _, body = client.request("GET", "/api/v1/prod_space/profile", expected=200, auth_header="APIKey")
     assert body == b"Alice", "userspace URL returned wrong value"
     client.request("GET", "/api/v1/other_space/profile", expected=403, auth_header="APIKey")
-    text_path = os.path.join(data_dir, "userspaces", "prod_space", "profile.txt")
-    with open(text_path, "rb") as f:
-        assert f.read() == b"Alice", "text mirror mismatch"
     client.request("PUT", "/api/v1/prod_space/profile", {"name": "Alice"}, expected=200, auth_header="APIKey")
-    assert not os.path.exists(text_path), "old text mirror still exists after JSON overwrite"
-    json_path = os.path.join(data_dir, "userspaces", "prod_space", "profile.json")
-    with open(json_path, "rb") as f:
-        assert json.loads(f.read())["name"] == "Alice", "json mirror mismatch"
-    return "APIKey header, userspace route isolation, and value file mirror verified"
+    _, _, body = client.request("GET", "/api/v1/prod_space/profile", expected=200, auth_header="APIKey")
+    assert json.loads(body)["name"] == "Alice", "JSON overwrite mismatch"
+    assert os.path.isfile(os.path.join(data_dir, "httpkvdb.db")), "persistent database missing"
+    assert not os.path.exists(os.path.join(data_dir, "userspaces")), "unexpected file mirror"
+    for key in ["100%", "a/b", "a%2Fb", "a//b", "x" * 4096]:
+        path = "/api/v1/prod_space/" + urllib.parse.quote(key, safe="")
+        client.request("PUT", path, key.encode(), content_type="text/plain", expected=200)
+        _, _, body = client.request("GET", path, expected=200)
+        assert body == key.encode(), "encoded key round trip mismatch"
+    return "userspace isolation, encoded keys, long keys, and database verified"
 
 
 def admin_create_userspace_check(admin_client, base_url, data_dir):
@@ -249,8 +251,6 @@ def admin_create_userspace_check(admin_client, base_url, data_dir):
     assert body == b"Bob", "created userspace API key failed"
     bob.request("GET", "/api/v1/prod_space/profile", expected=403, auth_header="APIKey")
     admin_client.request("POST", "/v1/admin/userspaces", {"userspace_id": "bob", "user_id": "bob"}, expected=409, auth_header="APIKey")
-    with open(os.path.join(data_dir, "userspaces", "bob", "profile.txt"), "rb") as f:
-        assert f.read() == b"Bob", "created userspace file mirror mismatch"
     return "admin-created userspace API key and duplicate conflict verified"
 
 

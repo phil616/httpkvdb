@@ -1,6 +1,6 @@
 import { AdminKeyInfo, ApiError, CreatedUserspace, ImportResult, KvMetadata, SessionState, TxResult, TxStatus, UserspaceInfo } from "./types";
 
-const defaultApiBaseUrl = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8080";
+const defaultApiBaseUrl = import.meta.env?.VITE_API_BASE_URL || "http://127.0.0.1:8080";
 const sessionStorageKey = "httpkvdb.console.session";
 
 export function initialSession(): SessionState {
@@ -152,7 +152,7 @@ export class ApiClient {
   async addTxOp(txId: string, seq: number, op: string, key: string, opId: string, contentType: string, body: string): Promise<TxStatus | TxResult> {
     const headers: Record<string, string> = {
       "X-KV-Op": op,
-      "X-KV-Key": key,
+      "X-KV-Key": encodeURIComponent(key),
       "X-KV-Op-Id": opId
     };
     let requestBody: string | undefined;
@@ -234,13 +234,17 @@ export class ApiClient {
     }
     const response = await fetch(`${this.session.apiBaseUrl}${path}`, { ...init, headers });
     if (!response.ok) {
-      let payload: unknown;
+      const text = await response.text();
+      let payload: string | { error: string; message: string; request_id?: string } = text;
       try {
-        payload = await response.json();
+        const parsed: unknown = JSON.parse(text);
+        if (typeof parsed === "object" && parsed !== null && "error" in parsed && typeof parsed.error === "string" && "message" in parsed && typeof parsed.message === "string") {
+          payload = { error: parsed.error, message: parsed.message, request_id: "request_id" in parsed && typeof parsed.request_id === "string" ? parsed.request_id : undefined };
+        }
       } catch {
-        payload = await response.text();
+        // Proxies and gateways can return non-JSON errors; preserve their text.
       }
-      throw new ApiError(response.status, payload as never);
+      throw new ApiError(response.status, payload);
     }
     return response;
   }

@@ -2,6 +2,7 @@ package tx
 
 import (
 	"context"
+	"log"
 	"time"
 )
 
@@ -14,7 +15,9 @@ func StartCleaner(ctx context.Context, c *Coordinator, interval time.Duration) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_, _ = c.ExpireDue()
+				if _, err := c.ExpireDue(); err != nil {
+					log.Printf("tx_cleanup_error")
+				}
 			}
 		}
 	}()

@@ -35,16 +35,21 @@ func TestStorePersistsUserspaceIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = s.Close() })
 	if _, err := s.Put("a", "same", []byte("one"), "text/plain"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Put("b", "same", []byte("two"), "text/plain"); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
 	reopened, err := Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = reopened.Close() })
 	ra, err := reopened.Get("a", "same")
 	if err != nil || string(ra.Value) != "one" {
 		t.Fatalf("userspace a mismatch: %q %v", string(ra.Value), err)

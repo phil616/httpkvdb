@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"errors"
-	"io"
 	"net/http"
 	"sync/atomic"
 
@@ -15,8 +14,8 @@ import (
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	p, _ := auth.PrincipalFromContext(r.Context())
 	s.lock.Lock()
-	defer s.lock.Unlock()
 	records, err := s.store.ExportUserspace(p.UserspaceID)
+	s.lock.Unlock()
 	if err != nil {
 		writeError(w, r, http.StatusInternalServerError, "STORAGE_ERROR", "storage error")
 		return
@@ -42,9 +41,9 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "BAD_REQUEST", "invalid import mode")
 		return
 	}
-	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.cfg.MaxValueSize))
+	data, err := readLimitedBody(w, r, s.cfg.MaxImportSize)
 	if err != nil {
-		writeError(w, r, http.StatusRequestEntityTooLarge, "VALUE_TOO_LARGE", "import too large")
+		writeBodyError(w, r, err)
 		return
 	}
 	records, err := importexport.Decode(data, s.cfg.MaxKeySize, s.cfg.MaxValueSize)

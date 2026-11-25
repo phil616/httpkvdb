@@ -40,15 +40,20 @@ func Decode(data []byte, maxKey int, maxValue int64) ([]model.KVRecord, error) {
 		return nil, ErrInvalidFormat
 	}
 	records := make([]model.KVRecord, 0)
+	keys := map[string]struct{}{}
 	for i := uint64(0); i < count; i++ {
 		var keyLen uint32
-		if binary.Read(r, binary.BigEndian, &keyLen) != nil || keyLen == 0 || keyLen > uint32(maxKey) {
+		if binary.Read(r, binary.BigEndian, &keyLen) != nil || keyLen == 0 || uint64(keyLen) > uint64(maxKey) {
 			return nil, ErrInvalidFormat
 		}
 		key, err := readBoundedBytes(r, uint64(keyLen), uint64(maxKey))
 		if err != nil {
 			return nil, ErrInvalidFormat
 		}
+		if _, exists := keys[string(key)]; exists {
+			return nil, ErrInvalidFormat
+		}
+		keys[string(key)] = struct{}{}
 		if err := storage.ValidateKey(string(key), maxKey); err != nil {
 			return nil, err
 		}
@@ -57,11 +62,11 @@ func Decode(data []byte, maxKey int, maxValue int64) ([]model.KVRecord, error) {
 			return nil, ErrInvalidFormat
 		}
 		ct, err := readBoundedBytes(r, uint64(ctLen), maxContentTypeLen)
-		if err != nil {
+		if err != nil || storage.ValidateContentType(string(ct)) != nil {
 			return nil, ErrInvalidFormat
 		}
 		vt, err := r.ReadByte()
-		if err != nil {
+		if err != nil || (vt != valueTypeString && vt != valueTypeJSON && vt != valueTypeBinary) {
 			return nil, ErrInvalidFormat
 		}
 		var valueLen uint64
@@ -107,7 +112,7 @@ func Decode(data []byte, maxKey int, maxValue int64) ([]model.KVRecord, error) {
 
 const (
 	minEncodedRecordLen = 4 + 1 + 2 + 1 + 8 + 8 + 8 + 8 + 32
-	maxContentTypeLen   = 255
+	maxContentTypeLen   = storage.MaxContentTypeSize
 )
 
 func maxRecordCount(remaining int) uint64 {

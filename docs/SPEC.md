@@ -1,10 +1,13 @@
 # KV over HTTP 单机强一致存储数据库技术规格说明书
 
-版本：v0.1  
+版本：v0.1（与当前实现同步）
+
 目标读者：Codex / Go 开发者 / 项目维护者  
 实现语言：Go  
 系统类型：单机 HTTP KV 数据库  
 核心目标：通过 HTTP 操作字符串 Key 与多类型 Value，并在单机环境下提供强一致事务能力。
+
+本文件规定服务行为。标记“建议”的目录、接口抽象和开发阶段仅用于设计参考，不代表额外功能已经实现。实际存储布局见 6.2，线协议见 11、16.3，实际配置名和默认值见 19。客户端接入说明见 [GUIDE.md](../GUIDE.md)，完整环境模板见 [configs/kvhttpd.env.example](../configs/kvhttpd.env.example)。
 
 ---
 
@@ -92,7 +95,9 @@ Key 必须是字符串。
 | 是否允许 `/` | 允许，但 HTTP path 中需要 URL encode |
 | 是否允许二进制 Key | 不允许 |
 
-服务端内部不得直接把 key 当作文件路径使用。必须通过编码、转义、哈希或底层 KV 引擎保存。
+服务端内部不得直接把 key 当作文件路径使用。当前实现将 Key 作为 bbolt bucket 中的键保存。
+
+HTTP 路径中的完整 Key 必须只 percent-encode 一次，服务端只解码一次；`a/b`、字面量 `a%2Fb`、`100%` 分别编码为 `a%2Fb`、`a%252Fb`、`100%25`。不使用表单编码，`+` 是字面量加号。路由器不会清理 Key 中的点段或重复斜杠。客户端或代理若会规范化 `.`、`..` 路径，应改用事务的 `X-KV-Key` Header 操作这些 Key。Key 没有目录、前缀查询或文件扩展名语义。
 
 ### 4.2 Value
 
@@ -130,13 +135,15 @@ Value 类型由 HTTP `Content-Type` 决定。
 
 对于二进制数据，服务端不得尝试解析内容。
 
+省略 Content-Type 时使用 `application/octet-stream`。Content-Type 最长 65535 字节（受导出格式 uint16 长度限制），不得包含 CR、LF 或 NUL；非法元信息返回 `400 BAD_REQUEST`。空 Value 可以通过普通 PUT 保存；事务 PUT 片段要求非空 body。
+
 ---
 
 ## 5. Userspace 模型
 
 ### 5.1 基本规则
 
-每个认证用户对应一个完整独立的 userspace。
+每个认证 Principal 对应一个 userspace，隔离边界是 userspace_id。多个凭据可以映射到同一 userspace；用户 ID 字符串相同本身不会授予其他 userspace 的权限。
 
 相同 key 在不同 userspace 中互不影响：
 
@@ -145,7 +152,7 @@ userspace_a: key1 -> value_a
 userspace_b: key1 -> value_b
 ```
 
-普通 KV 请求不能由客户端指定 userspace。userspace 必须由认证结果解析得到。
+普通 KV 请求不能由客户端任意指定授权 userspace。userspace 必须由认证结果解析得到。
 
 ### 5.2 Principal
 
@@ -197,31 +204,29 @@ User KV Space
 5. 事务失败不得部分写入。
 6. 认证数据与业务数据隔离。
 
-### 6.2 推荐目录结构
+### 6.2 当前存储布局
 
 ```text
-/data
-  /system
-    auth.db
-  /userspaces
-    kv.db
-  /tx
-    tx_state.db
-  /exports
-    tmp/
+<KVHTTP_STORAGE_PATH>/httpkvdb.db
 ```
 
-实现时可以使用单个本地嵌入式 KV 数据库文件，也可以拆成多个文件。无论使用哪种方式，都必须保持逻辑隔离。
+使用 bbolt v1.3.11，数据库以 0600 权限创建，新数据目录以 0700 权限创建。现有目录的权限不会自动修改。文件持有独占锁；第二个实例在约 1 秒后打开失败，不允许多进程同时写同一个数据库。相对路径以进程工作目录为基准，在打开时固定为绝对路径。
 
-推荐逻辑 bucket / namespace：
+实际 bucket：
 
 ```text
-system:users
-system:api_keys
-system:jwt
-kv:{userspace_id}
-tx:states
+meta                      # schema、全局版本序号、bootstrap 标记
+kv                        # 每个 userspace 对应一个嵌套 bucket
+system:api_keys            # HMAC-SHA256 APIKey 摘要与 Principal
+system:jwt_subjects        # JWT subject 与 Principal
+tx:states                 # 事务片段、状态与结果
 ```
+
+写入使用默认开启磁盘同步的原生事务，KV 更新与事务最终结果同一次提交。业务访问仍受全局串行化锁约束；不向客户端提供 MVCC 接口。
+
+没有存储 schema 标记时，若存在旧 `httpkvdb.json`，在一个原子事务内迁移全部 KV、认证、版本和事务状态。空、截断或缺少必需数据区的旧文件会导致启动失败；已有原生数据库缺少必需 bucket 或 schema 不可识别时也会拒绝启动，不自动补空数据区。迁移完成后以 `httpkvdb.db` 为唯一数据源，旧 JSON 和 `userspaces/` 镜像保留但不再读写。存在带 schema 标记的新数据库时，不会根据旧镜像恢复或覆盖新数据。旧版的重复 URL 解码别名不再成立；迁移保留已存储的逻辑 Key，不会自动改名，客户端应移除针对旧路由的二次编码补丁。
+
+升级前停服备份整个目录；当前数据库的完整备份需停服后复制 `httpkvdb.db`。`/v1/export` 仅导出当前 userspace 的 KV，不能替代包含认证和事务状态的完整备份。
 
 ### 6.3 版本号
 
@@ -251,7 +256,7 @@ checksum = sha256(value)
 
 ## 7. HTTP API 设计
 
-所有 API 默认路径前缀：
+普通 API 路径前缀（用户空间 KV 另使用 `/api/v1/{userspace_id}/{key}`）：
 
 ```text
 /v1
@@ -349,7 +354,7 @@ Authorization: ApiKey <api_key>
 HTTP/1.1 204 No Content
 ```
 
-如果 key 不存在，建议返回 404。也可以配置为幂等删除并返回 204。本项目默认采用严格语义：不存在返回 404。
+删除采用严格语义：不存在返回 `404 KEY_NOT_FOUND`。当前没有幂等删除配置。
 
 ### 8.4 元信息查询
 
@@ -397,12 +402,15 @@ Transaction
 - status: pending | waiting_for_ops | ready | committing | committed | aborted | expired
 - created_at: timestamp
 - deadline: timestamp
+- finished_at: timestamp（进入终态时设置，旧记录可能没有）
 - commit_received: bool
 - tx_digest: string optional
 - ops: map[int]TxOperation
 - result: TxResult optional
 - abort_reason: string optional
 ```
+
+ready / committing 为保留的内部枚举；当前对外或持久化的状态为 pending、waiting_for_ops、committed、aborted、expired。
 
 ### 10.2 TxOperation
 
@@ -480,8 +488,8 @@ Content-Type: application/json
 
 1. `total_ops` 必须大于 0。
 2. `total_ops` 不得超过配置上限，例如 1000。
-3. `timeout_ms` 不得超过配置上限，例如 300000。
-4. 如果客户端提供 `tx_id`，服务端必须校验其格式和唯一性。
+3. `timeout_ms` 省略或为 0 时使用默认超时，负值非法，不得超过配置上限，默认最大 300000。
+4. 如果客户端提供 `tx_id`，服务端校验格式；已存在的同 owner / total_ops 请求视为创建重试，返回原事务，其他复用返回 `400 INVALID_TX`。
 5. tx_id 一旦创建，必须绑定当前 user_id 和 userspace_id。
 6. 其他用户不能向该 tx_id 提交片段。
 
@@ -498,31 +506,34 @@ Content-Type: application/json
 {"name":"Alice"}
 ```
 
-成功：
+成功返回 `202 Accepted`。片段尚未触发提交时，响应示例：
 
-```http
-HTTP/1.1 202 Accepted
-Content-Type: application/json
-
+```json
 {
   "tx_id": "tx_abc123",
-  "seq": 1,
-  "status": "accepted"
+  "status": "pending",
+  "total_ops": 3,
+  "deadline": "2026-04-29T12:00:30Z",
+  "received_seq": [1],
+  "missing_seq": [2, 3]
 }
 ```
+
+若 commit 已到达，最后一个片段会触发执行；该片段请求仍返回 `202`，body 为 committed `TxResult`。客户端应检查 `status`，不能仅凭 `202` 判断事务仍在等待。
 
 规则：
 
 1. `seq` 从 1 开始。
 2. `seq` 必须小于等于 `total_ops`。
 3. `X-KV-Op` 必须是 `GET`、`PUT`、`DELETE`、`EXISTS`、`HEAD` 之一。
-4. `X-KV-Key` 必须是合法字符串 key。
+4. `X-KV-Key` 必须将完整 Key percent-encode 一次；服务端解码一次后校验 UTF-8 和长度。不要用 `+` 编码空格。
 5. `X-KV-Op-Id` 用于幂等重试，不能为空。
-6. PUT 必须携带 body。
-7. GET / DELETE / EXISTS / HEAD 不应该携带 body。
+6. PUT 必须携带非空 body，空 body 返回 `400 BAD_REQUEST`。
+7. GET / DELETE / EXISTS / HEAD 不得携带 body，包括未知长度或 chunked body，否则返回 `400 BAD_REQUEST`。
 8. JSON 类型 PUT 必须校验 JSON 合法性。
 9. 片段提交后不得立即执行。
 10. 片段必须持久化到事务状态存储，避免进程重启后事务状态完全丢失。
+11. 每个 PUT 片段受 `KVHTTP_MAX_VALUE_SIZE` 限制；同一事务所有片段 body 的累计字节数受 `KVHTTP_MAX_TX_BODY_SIZE` 限制，超出返回 `413 VALUE_TOO_LARGE`，不会接收该片段。相同片段重试不会重复计入大小。
 
 ### 11.3 事务片段冲突处理
 
@@ -536,9 +547,9 @@ content_type
 body_hash
 ```
 
-如果完全一致，返回 202，视为幂等重传。
+如果完全一致且事务未中止或过期，返回 202，视为幂等重传。已经 committed 的事务也返回原始 committed 结果，不重新执行。
 
-如果不一致，事务必须进入 aborted，返回：
+如果不一致且事务尚未终结，事务进入 aborted，返回以下错误；已经 committed 的事务保持 committed 并返回 `409 TX_ALREADY_COMMITTED`。aborted / expired 事务分别返回 `409 TX_ABORTED` / `410 TX_EXPIRED`，不会恢复为可写状态：
 
 ```http
 HTTP/1.1 409 Conflict
@@ -591,6 +602,14 @@ Content-Type: application/json
       "content_type": "application/json",
       "value_base64": "eyJuYW1lIjoiQWxpY2UifQ==",
       "version": 13
+    },
+    {
+      "seq": 3,
+      "op": "HEAD",
+      "status": 200,
+      "key": "profile",
+      "content_type": "application/json",
+      "version": 13
     }
   ]
 }
@@ -613,10 +632,13 @@ Content-Type: application/json
 规则：
 
 1. commit 请求可以早于部分片段到达。
-2. commit 不会立即失败，除非事务已经 aborted、expired 或身份不匹配。
+2. 等待缺失片段不是错误。事务终态、身份、参数、摘要或存储错误仍可能使 commit 失败。
 3. 一旦 commit_received=true，事务等待缺失片段直到 deadline。
 4. 所有片段到齐后，服务端应自动执行事务。
 5. 执行结果可以通过本次 commit 响应返回，也可以之后通过 result API 查询。
+6. 空 body 或 `{}` 表示使用已有 total_ops 且不新增摘要。非空控制 body 必须是单个 JSON 对象，非法 JSON、null、数组或尾随内容返回 `400 BAD_REQUEST`。创建事务、commit、创建 userspace 的 JSON body 上限均为 1 MiB，超限返回 `413 VALUE_TOO_LARGE`；未识别的 JSON 字段被忽略。
+7. `total_ops` 省略或为 0 时沿用创建值，其他值必须匹配。等待期间已指定的非空 `tx_digest` 不会被空重试清除；重试携带不同非空摘要返回 `400 INVALID_TX`。已提交事务的 commit 始终返回原结果。
+8. 当前摘要为兼容格式：按 seq 排序，逐条拼接 `<seq>\0<op_id>\0<op_type>\0<解码后的 key>\0<body_hash>\n` 的 UTF-8 字节，再计算 `sha256:<小写 hex>`。`\0` 为 NUL 字节，`\n` 为换行字节；body_hash 为原始 body 的 SHA-256（无 body 时散列空字节）。此摘要不覆盖 Content-Type，不能当作完整操作元信息的签名；身份认证仍必须独立完成。
 
 ### 11.5 查询事务状态或结果
 
@@ -674,7 +696,7 @@ Content-Type: application/json
 }
 ```
 
-已经 committed 的事务不能 abort。
+已经 committed 的事务不能 abort，返回 `409 TX_ALREADY_COMMITTED`；expired 返回 `410 TX_EXPIRED`；重复 abort 已 aborted 的事务返回同样的 200 状态。
 
 ---
 
@@ -703,10 +725,10 @@ Content-Type: application/json
 5. 开启底层存储事务
 6. 依次执行每个 op
 7. 记录每个 op 的结果
-8. 如果全部成功，提交底层存储事务
-9. 持久化 tx result
-10. 标记 tx.status = committed
-11. 释放 Global Serializable Lock
+8. 将 tx result、finished_at 与 committed 状态写入同一个底层事务
+9. 一次原子提交 KV 与 tx result，完成持久化确认
+10. 释放 Global Serializable Lock
+11. 发送响应（慢客户端不会改变已提交状态）
 ```
 
 如果第 6 步任意操作失败：
@@ -740,6 +762,8 @@ seq=4 读到 2
 
 事务外部不能看到 `a=1` 的中间状态，只能看到事务提交前状态或提交后最终状态。
 
+GET / HEAD / DELETE 读取或删除不存在的 Key 会回滚整个事务，HTTP 返回 `409`，body 为带失败项的 aborted `TxResult`。EXISTS 的不存在结果仅为该项的 `404 KEY_NOT_FOUND`，不会中止事务。EXISTS 不是条件写入或断言；事务不支持基于读结果动态执行分支。事务之外的“先读、计算、再写”不受同一次全局锁保护；严格唯一性、计数增量或列表读改写需要应用侧协调所有写入者，不能仅凭 Serializable 宣称它们无竞争。
+
 ---
 
 ## 13. 超时与清理
@@ -772,7 +796,9 @@ expired 事务不能再接收 ops 或 commit。
 1. 找到超过 deadline 的 pending / waiting_for_ops 事务。
 2. 标记为 expired。
 3. 可保留结果或错误状态一段时间供客户端查询。
-4. 超过 result retention 后删除事务片段 body，释放空间。
+4. 终态进入时间超过 `tx_result_retention_ms` 后删除事务片段 body；expired 的终态时间取 deadline，旧记录没有 finished_at 时以 deadline 为基准。
+5. 保留 op_id、Key、body_hash 等片段身份信息和完整最终结果，以支持已提交操作的重试。该配置不删除事务记录或结果；GET 结果中的 base64 Value 仍可能占空间。pending / waiting_for_ops 在未过期时不清理 body。
+6. 清理释放可复用的数据库页，不保证缩小磁盘文件；当前没有自动压缩或终态记录删除接口。清理失败会记录不含内容的 `tx_cleanup_error` 事件，并在下个周期重试。
 
 推荐配置：
 
@@ -846,10 +872,10 @@ X-API-Key: <api_key>
 
 JWT 验证流程：
 
-1. 解析 Authorization Header。
+1. 解析唯一的认证 Header（见 15.3）。
 2. 验证 Bearer token 格式。
-3. 校验签名。
-4. 校验 exp、nbf、iss、aud。
+3. 校验 Header 的 `alg=HS256` 并验证 HMAC-SHA256 签名；不支持其他算法、非空 crit 扩展或 JWKS/kid 选钥。
+4. 要求非空 sub 和有效的 exp；exp 必填且必须晚于当前时间。nbf 若提供则校验，iss / aud 仅在配置了对应预期值时校验；aud 支持字符串或字符串数组。
 5. 提取 subject。
 6. 从系统认证空间映射到 user_id 和 userspace_id。
 7. 生成 Principal。
@@ -866,20 +892,22 @@ APIKey 验证流程：
 6. 映射到 user_id 和 userspace_id。
 7. 生成 Principal。
 
-系统不得保存 APIKey 明文。
+系统不得保存 APIKey 明文。实际摘要为 `hmac-sha256:<hex>`，pepper 来自 `KVHTTP_API_KEY_PEPPER`，为空时使用 JWTSecret。
+
+每个请求只允许一种非空凭据来源：APIKey、X-API-Key 或 Authorization。重复的同名认证 Header 或多种来源同时出现均返回 `401 UNAUTHORIZED`，不会按优先级选择。Authorization 的 ApiKey / Bearer scheme 不区分大小写。服务不提供登录、签发 JWT 或用户自注册接口；JWT subject 需要预先映射到系统认证区，创建 userspace 的 HTTP 接口只生成 APIKey。
 
 ### 15.4 Auth Cache
 
 为了避免每个请求都读硬盘，必须实现认证缓存。
 
-推荐缓存对象：
+实际缓存对象：
 
 ```text
 api_key_hash -> Principal
 jwt_subject -> Principal
-jwt_kid -> verification_key
-user_id -> userspace_id
 ```
+
+每次 Bearer 请求仍会校验签名和时效，再使用 subject 缓存。认证管理操作会主动失效缓存，失效期间的旧查询不能重新填回过期 Principal。
 
 缓存策略：
 
@@ -951,10 +979,13 @@ X-KV-Import-Mode: replace
 5. 在底层存储事务中应用导入。
 6. 成功提交后返回导入统计。
 7. 任意失败必须 rollback。
+8. 整个导入体受 `KVHTTP_MAX_IMPORT_SIZE` 限制，每条 Value 仍受 `KVHTTP_MAX_VALUE_SIZE` 限制；两者包括的对象不同。导入导出目前整包缓冲在内存中，不是流式操作；导出本身没有总大小上限，超出导入上限的导出需要调大上限才能重导入。
+9. 导入默认 replace；每条实际写入分配新的全局版本和 updated_at，保留非零 created_at，重算 checksum / value_type。导入是内容恢复，不恢复原版本序号或覆盖其他 userspace。
+10. 导出在全局锁内复制一致快照，随后在锁外编码并发送；导入在锁外完成解析，在全局锁内原子应用。
 
 ### 16.3 二进制格式
 
-建议格式：
+实际格式（version=1，无可选 header checksum）：
 
 ```text
 Header
@@ -962,7 +993,6 @@ Header
 - format_version: uint32
 - created_at_unix_ms: int64
 - record_count: uint64
-- header_checksum: [32]byte optional
 
 Record[]
 - key_len: uint32
@@ -981,7 +1011,7 @@ Footer
 - full_checksum: [32]byte
 ```
 
-所有整数建议使用 Big Endian 或 Little Endian，但必须在格式说明中固定。建议使用 Big Endian。
+所有整数固定使用 Big Endian。value_type 编码为 1=string、2=json、3=binary，其他值和重复 Key 均为非法格式。每条 checksum 是 value 原始字节的 SHA-256；footer 是其之前全部字节的 SHA-256。时间戳单位为 Unix 毫秒。Content-Type 使用 uint16 长度，最多 65535 字节。
 
 ---
 
@@ -991,38 +1021,7 @@ Footer
 
 日志必须避免记录 value 内容。
 
-建议记录：
-
-```text
-request_id
-method
-path_template
-status_code
-latency_ms
-user_id_hash
-userspace_id_hash
-tx_id
-op_count
-value_size
-error_code
-```
-
-关键事件：
-
-```text
-server_start
-server_stop
-auth_failed
-auth_cache_miss
-tx_created
-tx_committed
-tx_aborted
-tx_expired
-import_started
-import_finished
-export_finished
-storage_error
-```
+当前记录服务启动、停止、启动失败及 `tx_cleanup_error`。没有逐请求访问日志、认证审计日志或事务事件日志；不得记录 value、APIKey、JWT 或 Authorization。新增日志时同样遵守这些限制。
 
 ### 17.2 Metrics
 
@@ -1032,11 +1031,10 @@ storage_error
 GET /metrics
 ```
 
-建议指标：
+实际提供的无标签计数器：
 
 ```text
 http_requests_total
-http_request_duration_seconds
 kv_get_total
 kv_put_total
 kv_delete_total
@@ -1044,13 +1042,11 @@ tx_created_total
 tx_committed_total
 tx_aborted_total
 tx_expired_total
-auth_cache_hit_total
-auth_cache_miss_total
-global_lock_wait_seconds
-storage_operation_duration_seconds
 import_total
 export_total
 ```
+
+事务计数器按成功持久化的状态变化累计，重试不重复计数，最终片段触发的自动提交也计入。kv_get_total 包含普通 GET 与 HEAD。http_requests_total 包含探针和指标请求，CORS OPTIONS 在该计数层之前处理。计数器仅在进程内保存，重启归零。目前没有延迟、锁等待、认证缓存命中指标或 labels。
 
 ### 17.3 Health Check
 
@@ -1064,17 +1060,13 @@ GET /healthz
 GET /readyz
 ```
 
-需要检查：
-
-1. 存储是否可访问。
-2. 系统认证空间是否可访问。
-3. 后台清理任务是否已启动。
+检查数据库是否可以开启只读事务、schema 是否可识别、KV / 认证 / 事务 bucket 是否齐全。失败返回 `503 STORAGE_ERROR`。此探针不执行落盘写测试，也不检查磁盘剩余空间或后台清理 goroutine 的健康状态。GET 返回 `ok\n`；HEAD 仅返回相同状态与响应头。
 
 ---
 
 ## 18. 错误格式
 
-所有 JSON 错误响应必须使用统一格式：
+除事务操作失败的 aborted `TxResult`（见 12.3）外，应用错误响应使用统一格式；HEAD 只发送状态和响应头：
 
 ```json
 {
@@ -1090,18 +1082,24 @@ GET /readyz
 |---|---|---|
 | 400 | `BAD_REQUEST` | 请求格式错误 |
 | 400 | `INVALID_KEY` | key 不合法 |
+| 400 | `INVALID_USERSPACE` | userspace 不合法 |
 | 400 | `INVALID_TX` | 事务参数不合法 |
 | 401 | `UNAUTHORIZED` | 未认证或认证失败 |
 | 403 | `FORBIDDEN` | 无权限 |
 | 404 | `KEY_NOT_FOUND` | key 不存在 |
 | 404 | `TX_NOT_FOUND` | 事务不存在 |
+| 404 | `USERSPACE_NOT_FOUND` | 管理接口的 userspace 不存在 |
+| 404 | `NOT_FOUND` | 路由或该方法对应的端点不存在 |
+| 405 | `METHOD_NOT_ALLOWED` | KV 端点不支持该方法 |
+| 409 | `USERSPACE_EXISTS` | userspace 已存在 |
 | 409 | `SEQ_CONFLICT` | 同一事务序号内容冲突 |
 | 409 | `TX_ALREADY_COMMITTED` | 事务已提交 |
 | 409 | `TX_ABORTED` | 事务已中止 |
 | 410 | `TX_EXPIRED` | 事务已过期 |
-| 413 | `VALUE_TOO_LARGE` | value 过大 |
+| 413 | `VALUE_TOO_LARGE` | 请求体或事务累计 body 超限 |
 | 422 | `INVALID_JSON` | JSON Value 不合法 |
 | 500 | `STORAGE_ERROR` | 存储错误 |
+| 503 | `STORAGE_ERROR` | 就绪检查失败 |
 
 ---
 
@@ -1109,23 +1107,33 @@ GET /readyz
 
 服务必须支持配置文件或环境变量。
 
-建议配置：
+未指定 `--config` 时仅加载进程环境中 `KVHTTP_` 开头的变量；指定 `--config <path>` 时只读取该文件，不叠加进程环境。缺失项和空值使用默认值。文件使用 `KEY=value`，支持空行、整行 `#` 注释、`export ` 前缀、单引号字面量和双引号 Go 转义；不是 shell 脚本，不展开变量或命令，不支持行内注释。未知配置名、重复文件配置名、非法引号和非十进制数值导致启动失败，不回显配置值。
 
-```text
-server.addr = "0.0.0.0:8080"
-storage.path = "./data"
-max_key_size = 4096
-max_value_size = 104857600
-max_tx_ops = 1000
-default_tx_timeout_ms = 30000
-max_tx_timeout_ms = 300000
-tx_clean_interval_ms = 5000
-tx_result_retention_ms = 3600000
-auth_cache_ttl_ms = 60000
-auth_cache_max_entries = 10000
-log.level = "info"
-metrics.enabled = true
-```
+| 配置名 | 默认值 | 约束 / 含义 |
+|---|---|---|
+| `KVHTTP_ADDR` | `0.0.0.0:8080` | HTTP 监听地址 |
+| `KVHTTP_STORAGE_PATH` | `./data` | 数据目录，非数据库文件名 |
+| `KVHTTP_CORS_ALLOWED_ORIGINS` | `http://127.0.0.1:5173,http://localhost:5173` | 逗号分隔 Origin；`*` 表示任意 Origin |
+| `KVHTTP_MAX_KEY_SIZE` | `4096` | 1–32768 字节，后端键大小限制 |
+| `KVHTTP_MAX_VALUE_SIZE` | `104857600` | 单 Value / 单 PUT 片段的字节上限 |
+| `KVHTTP_MAX_IMPORT_SIZE` | `1073741824` | 整个导入体的字节上限 |
+| `KVHTTP_MAX_TX_OPS` | `1000` | 单事务操作数上限 |
+| `KVHTTP_MAX_TX_BODY_SIZE` | `268435456` | 单事务累计 body 字节上限 |
+| `KVHTTP_DEFAULT_TX_TIMEOUT_MS` | `30000` | 不得大于 max timeout |
+| `KVHTTP_MAX_TX_TIMEOUT_MS` | `300000` | 单事务最大等待毫秒数 |
+| `KVHTTP_TX_CLEAN_INTERVAL_MS` | `5000` | 过期和 body 清理周期 |
+| `KVHTTP_TX_RESULT_RETENTION_MS` | `3600000` | 终态片段 body 保留期；不删除结果 |
+| `KVHTTP_AUTH_CACHE_TTL_MS` | `60000` | Principal 缓存 TTL |
+| `KVHTTP_AUTH_CACHE_MAX_ENTRIES` | `10000` | Principal 缓存条目上限 |
+| `KVHTTP_BOOTSTRAP_USER_ID` | `admin` | 首次初始化的用户 ID |
+| `KVHTTP_BOOTSTRAP_USERSPACE_ID` | `admin_space` | 首次初始化的 userspace |
+| `KVHTTP_BOOTSTRAP_API_KEY` | `dev-secret-key` | 仅适合本地开发的默认 Key |
+| `KVHTTP_API_KEY_PEPPER` | 空 | 为空时使用 JWTSecret；应单独设置 |
+| `KVHTTP_JWT_SECRET` | `dev-jwt-secret` | HS256 密钥，生产必须替换 |
+| `KVHTTP_JWT_ISSUER` | 空 | 非空时校验 iss |
+| `KVHTTP_JWT_AUDIENCE` | 空 | 非空时校验 aud |
+
+所有数值限制必须为正，毫秒数还必须能安全转换成 time.Duration。服务没有 `log.level`、`metrics.enabled`、幂等删除等配置。限制作用于单个请求或事务；没有全局活动事务数量或缓冲总额限制，应结合部署资源控制负载。
 
 ---
 
@@ -1286,7 +1294,7 @@ Codex 实现时必须补充自动化测试。
 1. 启动时如果 system auth store 不存在，可以根据配置创建初始管理员用户。
 2. 支持从环境变量注入初始 APIKey。
 3. 初始 APIKey 只保存 hash。
-4. 初始用户拥有一个 userspace。
+4. 初始用户拥有一个 userspace。bootstrap 只在无认证记录且未标记初始化时创建；之后不会恢复已删除或轮换的 Key。
 5. 管理员可以创建新的 userspace，并为其生成 APIKey。
 
 建议环境变量：
@@ -1324,6 +1332,8 @@ Content-Type: application/json
 
 `api_key` 明文只允许在创建响应中返回一次，磁盘中只能保存其 HMAC-SHA256 摘要。重复创建同一 userspace 必须返回 `409 USERSPACE_EXISTS`。
 
+userspace_id 必须匹配 `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`；未指定 user_id 时使用 userspace_id。创建 userspace 只发放 APIKey，不创建 JWT subject。
+
 管理员 userspace 管理 API：
 
 ```text
@@ -1337,7 +1347,7 @@ HEAD   /v1/admin/userspaces/{userspace_id}/kv/{key}
 DELETE /v1/admin/userspaces/{userspace_id}/kv/{key}
 ```
 
-以上接口必须要求 `admin` 角色。管理员 KV 操作用于颗粒化运维管理，必须和普通 CRUD 一样经过全局串行化锁，不得记录原始 value。APIKey 轮换只允许在响应中返回新明文一次，并应使旧 APIKey 失效。
+以上接口必须要求 `admin` 角色。管理员 KV 操作用于颗粒化运维管理，必须和普通 CRUD 一样经过全局串行化锁，不得记录原始 value。APIKey 轮换只允许在响应中返回新明文一次，使该 userspace 的旧 APIKey 失效并保留 Principal 的角色。删除 userspace 会原子删除其 KV、APIKey、JWT subject 和事务状态，且不会被下次 bootstrap 重建。
 
 ---
 

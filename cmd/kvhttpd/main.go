@@ -22,18 +22,21 @@ import (
 func main() {
 	configPath := flag.String("config", "", "path to env-style config file")
 	flag.Parse()
-	cfg := config.Load()
+	var cfg config.Config
+	var err error
 	if *configPath != "" {
-		var err error
 		cfg, err = config.LoadFromFile(*configPath)
-		if err != nil {
-			log.Fatalf("config_error: %v", err)
-		}
+	} else {
+		cfg, err = config.Load()
+	}
+	if err != nil {
+		log.Fatalf("config_error: %v", err)
 	}
 	store, err := storage.Open(cfg.StoragePath)
 	if err != nil {
 		log.Fatalf("storage_error: %v", err)
 	}
+	defer store.Close()
 	apiKeyPepper := cfg.APIKeyPepper
 	if apiKeyPepper == "" {
 		apiKeyPepper = cfg.JWTSecret
@@ -44,7 +47,7 @@ func main() {
 	serial := &lock.Serializable{}
 	authn := auth.New(store, cfg.JWTSecret, apiKeyPepper, cfg.JWTIssuer, cfg.JWTAudience, time.Duration(cfg.AuthCacheTTLMS)*time.Millisecond, cfg.AuthCacheMaxEntries)
 	metrics := &observe.Metrics{}
-	coord := httptx.NewCoordinator(store, serial, cfg.MaxTxOps, time.Duration(cfg.DefaultTxTimeoutMS)*time.Millisecond, time.Duration(cfg.MaxTxTimeoutMS)*time.Millisecond)
+	coord := httptx.NewCoordinator(store, serial, cfg.MaxTxOps, time.Duration(cfg.DefaultTxTimeoutMS)*time.Millisecond, time.Duration(cfg.MaxTxTimeoutMS)*time.Millisecond, httptx.Options{MaxBodySize: cfg.MaxTxBodySize, ResultRetention: time.Duration(cfg.TxResultRetentionMS) * time.Millisecond, Metrics: metrics})
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	httptx.StartCleaner(ctx, coord, time.Duration(cfg.TxCleanIntervalMS)*time.Millisecond)

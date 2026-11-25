@@ -13,9 +13,10 @@ Version synchronization rules are documented in [VERSIONS.md](VERSIONS.md).
 
 - `.github/workflows/release.yml`
   - Runs on tags matching `v*`.
-  - Runs Go tests and frontend build.
+  - Runs Go tests, frontend client tests, and frontend build.
   - Builds release archives for Linux, macOS, and Windows.
   - Publishes `.tar.gz` archives and `.sha256` files to GitHub Releases.
+  - Archives include the server binary, README files, GUIDE.md, docs/configs/scripts, the bundled persistence skill, and separately hosted Web assets.
 
 ## First Push
 

@@ -1,14 +1,11 @@
 package httpapi
 
 import (
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"httpkvdb/internal/auth"
@@ -25,27 +22,37 @@ type createTxRequest struct {
 
 func (s *Server) handleCreateTx(w http.ResponseWriter, r *http.Request) {
 	var req createTxRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		writeError(w, r, http.StatusBadRequest, "BAD_REQUEST", "bad request")
+	if !readJSONObject(w, r, &req, false) {
+		return
+	}
+	if req.TimeoutMS < 0 || req.TimeoutMS > s.cfg.MaxTxTimeoutMS {
+		writeError(w, r, http.StatusBadRequest, "INVALID_TX", "invalid transaction timeout")
 		return
 	}
 	p, _ := auth.PrincipalFromContext(r.Context())
 	t, err := s.tx.CreateTx(p, req.TotalOps, time.Duration(req.TimeoutMS)*time.Millisecond, req.TxID)
 	if err != nil {
-		writeError(w, r, http.StatusBadRequest, "INVALID_TX", "invalid transaction")
+		if errors.Is(err, httptx.ErrInvalidTx) {
+			writeError(w, r, http.StatusBadRequest, "INVALID_TX", "invalid transaction")
+		} else {
+			writeError(w, r, http.StatusInternalServerError, "STORAGE_ERROR", "storage error")
+		}
 		return
 	}
-	atomic.AddUint64(&s.metrics.TxCreated, 1)
 	writeJSON(w, http.StatusCreated, map[string]any{"tx_id": t.TxID, "status": t.Status, "total_ops": t.TotalOps, "deadline": t.Deadline})
 }
 
 func (s *Server) handleTx(w http.ResponseWriter, r *http.Request, rest string) {
 	parts := strings.Split(rest, "/")
 	if len(parts) < 2 {
-		http.NotFound(w, r)
+		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "route not found")
 		return
 	}
-	txID := parts[0]
+	txID, err := url.PathUnescape(parts[0])
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "INVALID_TX", "invalid transaction")
+		return
+	}
 	switch {
 	case len(parts) == 3 && parts[1] == "ops" && r.Method == http.MethodPost:
 		seq, err := strconv.Atoi(parts[2])
@@ -61,7 +68,7 @@ func (s *Server) handleTx(w http.ResponseWriter, r *http.Request, rest string) {
 	case len(parts) == 2 && parts[1] == "abort" && r.Method == http.MethodPost:
 		s.handleAbort(w, r, txID)
 	default:
-		http.NotFound(w, r)
+		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "route not found")
 	}
 }
 
@@ -80,14 +87,18 @@ func (s *Server) handleAddOp(w http.ResponseWriter, r *http.Request, txID string
 	}
 	var body []byte
 	if opType == "PUT" {
-		body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, s.cfg.MaxValueSize))
-		if err != nil || len(body) == 0 {
-			writeError(w, r, http.StatusRequestEntityTooLarge, "VALUE_TOO_LARGE", "value too large")
+		var ok bool
+		body, ok = s.readBody(w, r)
+		if !ok {
 			return
 		}
-		ct := r.Header.Get("Content-Type")
-		if ct == "" {
-			ct = "application/octet-stream"
+		if len(body) == 0 {
+			writeError(w, r, http.StatusBadRequest, "BAD_REQUEST", "PUT fragment requires a non-empty body")
+			return
+		}
+		ct, ok := requestContentType(w, r)
+		if !ok {
+			return
 		}
 		if err := storage.ValidateValue(ct, body); err != nil {
 			writeError(w, r, http.StatusUnprocessableEntity, "INVALID_JSON", "invalid json")
@@ -98,7 +109,7 @@ func (s *Server) handleAddOp(w http.ResponseWriter, r *http.Request, txID string
 		s.writeTxOutcome(w, r, status, result, err, http.StatusAccepted)
 		return
 	}
-	if r.ContentLength > 0 {
+	if _, err := readLimitedBody(w, r, 0); err != nil {
 		writeError(w, r, http.StatusBadRequest, "BAD_REQUEST", "operation must not include body")
 		return
 	}
@@ -112,14 +123,11 @@ func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, txID strin
 		TotalOps int    `json:"total_ops"`
 		TxDigest string `json:"tx_digest"`
 	}
-	if r.Body != nil {
-		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req)
+	if !readJSONObject(w, r, &req, true) {
+		return
 	}
 	p, _ := auth.PrincipalFromContext(r.Context())
 	status, result, err := s.tx.Commit(p, txID, req.TotalOps, req.TxDigest)
-	if result != nil && result.Status == model.TxCommitted {
-		atomic.AddUint64(&s.metrics.TxCommitted, 1)
-	}
 	if result != nil {
 		s.writeTxOutcome(w, r, status, result, err, http.StatusOK)
 		return
@@ -137,7 +145,6 @@ func (s *Server) handleAbort(w http.ResponseWriter, r *http.Request, txID string
 	p, _ := auth.PrincipalFromContext(r.Context())
 	status, err := s.tx.Abort(p, txID)
 	if err == nil {
-		atomic.AddUint64(&s.metrics.TxAborted, 1)
 		writeJSON(w, http.StatusOK, map[string]any{"tx_id": status.TxID, "status": status.Status})
 		return
 	}
@@ -161,8 +168,12 @@ func (s *Server) writeTxOutcome(w http.ResponseWriter, r *http.Request, status h
 			writeError(w, r, http.StatusGone, "TX_EXPIRED", "transaction expired")
 		case errors.Is(err, storage.ErrNotFound):
 			writeJSON(w, http.StatusConflict, result)
-		default:
+		case errors.Is(err, httptx.ErrBodyTooLarge):
+			writeError(w, r, http.StatusRequestEntityTooLarge, "VALUE_TOO_LARGE", "transaction body limit exceeded")
+		case errors.Is(err, httptx.ErrInvalidTx):
 			writeError(w, r, http.StatusBadRequest, "INVALID_TX", "invalid transaction")
+		default:
+			writeError(w, r, http.StatusInternalServerError, "STORAGE_ERROR", "storage error")
 		}
 		return
 	}

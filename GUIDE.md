@@ -1,481 +1,223 @@
 # HTTPKVDB Agent Integration Guide
 
-This file is the client contract for AI agents that need to use an HTTPKVDB instance after a human provides:
+This guide describes the implemented client API. The authoritative behavior specification is [docs/SPEC.md](docs/SPEC.md); deployment and backup instructions are in [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
-- `BASE_URL`: HTTPKVDB service origin, for example `https://kvdb-api.example.com`
-- `APP_NAME`: the third-party application name, used as the HTTPKVDB userspace, for example `webapp`
-- `API_KEY`: API key plaintext
+## Connection and Identity
 
-Treat `API_KEY`, JWTs, `Authorization`, request bodies, and response values as secrets unless the task explicitly says otherwise. Do not log them.
+Obtain the service origin (`BASE_URL`), an assigned `USERSPACE_ID`, and an APIKey or JWT from the operator. An application name such as `webapp` is a useful userspace convention, not a server requirement. Always use the userspace actually assigned to the credential.
 
-## Application Userspace Contract
+Each authenticated Principal maps to one userspace. Multiple credentials can share that userspace. Ordinary clients cannot select a different userspace by changing a URL. Admin endpoints explicitly allow an `admin` Principal to manage other userspaces.
 
-Every third-party application must use its own application name as its HTTPKVDB userspace.
+Send exactly one non-empty credential source:
 
-Example:
+```http
+APIKey: <api_key>
+X-API-Key: <api_key>
+Authorization: ApiKey <api_key>
+Authorization: Bearer <jwt>
+```
 
-- application name: `webapp`
-- userspace: `webapp`
-- KV path prefix: `/api/v1/webapp/`
+These are alternatives. Multiple sources or repeated authentication headers return `401 UNAUTHORIZED`. Authorization schemes are case-insensitive. Do not put credentials in query strings or log credentials, JWTs, Authorization headers, or stored values.
 
-The HTTPKVDB administrator creates that userspace and gives the application operator:
+JWT verification supports HS256 with the configured secret. `sub` and an unexpired `exp` are required; `nbf` is checked when supplied. `iss` and `aud` are checked when their expected values are configured. The server has no login or JWT issuance API and does not support JWKS. A JWT subject must already have a server-side mapping; creating a userspace through HTTP generates an APIKey only.
 
-- the service address, such as `https://kvdb-api.example.com`
-- the APIKey generated for that userspace
+Optional `X-Request-Id` is returned in the response headers and error envelope. Public endpoints are `GET /healthz`, `GET /readyz`, and `GET /metrics`; HEAD is also supported. `/readyz` checks database/schema/bucket accessibility, not disk free space, durable write success, or cleaner health. The backend does not serve the Web console bundle.
 
-The application must then perform all ordinary KV operations inside its dedicated userspace:
+## Key Encoding and Value Types
+
+Use either ordinary KV route:
 
 ```text
-https://kvdb-api.example.com/api/v1/webapp/{url-encoded-key}
+/v1/kv/{encoded-key}
+/api/v1/{userspace_id}/{encoded-key}
 ```
 
-Do not use another application name as the userspace. Do not share one userspace across unrelated applications. The server rejects a URL userspace that does not match the APIKey's authenticated principal with `403 FORBIDDEN`.
+The first uses the authenticated userspace. The second also checks its userspace segment against the Principal and returns `403 FORBIDDEN` on mismatch. Userspace IDs match `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`. Names such as `kv`, `tx`, and `admin` are valid userspaces.
 
-## Connection Model
+Keys are non-empty UTF-8 strings, limited to 4096 bytes by default (configurable up to 32768). Percent-encode the entire logical key exactly once:
 
-HTTPKVDB is a single-node strongly consistent KV database exposed over HTTP. Authenticated endpoints are under `/v1` and `/api/v1`. Each credential resolves server-side to exactly one `userspace`; `/api/v1/{userspace}/{key}` is allowed only when the URL userspace matches the authenticated principal.
+| Logical key | Encoded key |
+|---|---|
+| `agents/session/42` | `agents%2Fsession%2F42` |
+| `a%2Fb` | `a%252Fb` |
+| `100%` | `100%25` |
+| `a b` | `a%20b` |
+| `a+b` | `a%2Bb` |
 
-Use HTTPS when available. For every authenticated request, send one of:
+The server decodes once and does not normalize dot segments or repeated slashes in keys. Use path encoding, not form encoding: `+` means plus, not space. Clients/proxies must preserve the encoded path. Browsers can normalize `.` and `..` even when percent-encoded; use transaction operations with `X-KV-Key` for those keys. Keys have no filesystem or directory semantics.
+
+`X-KV-Key` in transaction fragments uses the same encoding rule: encode the complete logical key once. A percent-encoded field inside an application key is part of the logical key and its `%` must be encoded for transport too.
+
+| Content-Type | Stored value_type |
+|---|---|
+| `text/plain` (parameters allowed) | string |
+| `application/json` (parameters allowed) | json, validated |
+| `application/octet-stream` or omitted | binary |
+| Other types | binary; original Content-Type preserved |
+
+Content-Type is limited to 65535 bytes and cannot contain CR, LF, or NUL. Ordinary PUT accepts an empty value; transaction PUT fragments require a non-empty body. Invalid JSON values return `422 INVALID_JSON`.
+
+## Ordinary CRUD
+
+| Method | Successful response |
+|---|---|
+| PUT | 200, empty body, `X-KV-Version` |
+| GET | 200, raw value and metadata headers |
+| HEAD | 200, metadata headers without a body |
+| DELETE | 204, empty body |
+
+GET/HEAD metadata: stored `Content-Type`, `X-KV-Version`, `X-KV-Size` in bytes, and `X-KV-Checksum` as `sha256:<hex>`. Missing GET/HEAD/DELETE keys return `404 KEY_NOT_FOUND`; there is no idempotent-delete switch. KV methods outside this set return `405 METHOD_NOT_ALLOWED`.
+
+CRUD, imports, exports, and transaction state changes use the same global serializable lock. Reads/exports copy a consistent snapshot under that lock, then send it after releasing the lock. Multiple separate HTTP requests do not constitute one transaction.
+
+```sh
+BASE_URL="https://kvdb-api.example.com"
+USERSPACE_ID="webapp"
+# API_KEY must already be set privately; never enable shell tracing here.
+ENCODED_KEY="$(python3 -c 'import urllib.parse; print(urllib.parse.quote("agent/smoke", safe=""))')"
+
+curl -fsS -X PUT "$BASE_URL/api/v1/$USERSPACE_ID/$ENCODED_KEY" \
+  -H "APIKey: $API_KEY" -H 'Content-Type: application/json' \
+  --data '{"ok":true}'
+
+# This prints the value; capture it privately when values are sensitive.
+curl -fsS "$BASE_URL/api/v1/$USERSPACE_ID/$ENCODED_KEY" -H "APIKey: $API_KEY"
+```
+
+## Multi-Request Transactions
+
+All transactions are bound to the creating `user_id` and `userspace_id`. The operations are fixed in advance; there is no conditional write, compare-and-set, increment, or branching on read results.
+
+| Request | Behavior |
+|---|---|
+| `POST /v1/tx` | Create with `total_ops`, optional `tx_id` and `timeout_ms`; 201 even on an identical creation retry |
+| `POST /v1/tx/{tx_id}/ops/{seq}` | Record fragment; 202, including when the final fragment auto-commits |
+| `POST /v1/tx/{tx_id}/commit` | 200 with result when complete; 202 while missing fragments |
+| `GET /v1/tx/{tx_id}/result` | 200 with status or final result, including expired/aborted status |
+| `POST /v1/tx/{tx_id}/abort` | 200 with aborted status; committed cannot be aborted |
+
+`tx_id` must match `[A-Za-z0-9_.:-]{1,128}` when supplied. Encode it as a URL segment. `timeout_ms=0` or omitted uses the default 30000 ms; negative values are invalid and the default maximum is 300000 ms. `total_ops` is positive and at most 1000 by default.
+
+Create:
 
 ```http
-Authorization: ApiKey <API_KEY>
-Authorization: Bearer <JWT>
-APIKey: <API_KEY>
-X-API-Key: <API_KEY>
+POST /v1/tx
+APIKey: <api_key>
+Content-Type: application/json
+
+{"tx_id":"client-operation-42","total_ops":2,"timeout_ms":30000}
 ```
 
-When a human gives an API key, prefer `APIKey: <API_KEY>` for the userspace URL API. `Authorization: ApiKey <API_KEY>` remains supported for all authenticated APIs.
-
-Optional request correlation:
+Fragment headers:
 
 ```http
-X-Request-Id: <client-generated-id>
-```
-
-Unauthenticated probes:
-
-```http
-GET /healthz
-GET /readyz
-GET /metrics
-```
-
-`/healthz` and `/readyz` return `200` with `ok\n` when healthy/ready.
-
-## Key Encoding
-
-Keys are strings and are placed in the URL path:
-
-```text
-/v1/kv/{url-encoded-key}
-/api/v1/{userspace}/{url-encoded-key}
-```
-
-Always URL-encode the full key as one path segment. Encode `/` as `%2F`; do not let HTTP client path normalization split the key.
-
-Examples:
-
-- key `profile` -> `/v1/kv/profile`
-- key `agents/session/42` -> `/v1/kv/agents%2Fsession%2F42`
-- key `a b` -> `/v1/kv/a%20b`
-- app/userspace `webapp`, key `profile` -> `/api/v1/webapp/profile`
-
-## Value Types
-
-HTTPKVDB stores opaque bytes plus `Content-Type`.
-
-Supported client conventions:
-
-- `text/plain` for strings
-- `application/json` for JSON values; invalid JSON is rejected with `422 INVALID_JSON`
-- `application/octet-stream` for binary values
-
-If `Content-Type` is omitted on write, the server stores `application/octet-stream`.
-
-## Ordinary KV Operations
-
-Ordinary `PUT`, `GET`, `HEAD`, and `DELETE` are single-operation serializable transactions.
-
-### Put
-
-```http
-PUT /v1/kv/{key}
-APIKey: <API_KEY>
+POST /v1/tx/client-operation-42/ops/1
+APIKey: <api_key>
+X-KV-Op: PUT
+X-KV-Key: agents%2Fsession%2F42
+X-KV-Op-Id: stable-fragment-id
 Content-Type: application/json
 
 {"state":"ready"}
 ```
 
-Success:
+`seq` ranges from 1 through `total_ops`. `X-KV-Op` accepts PUT, GET, HEAD, DELETE, or EXISTS. Every fragment needs a stable non-empty `X-KV-Op-Id`. Non-PUT fragments must have no body, including chunked bodies. No fragment reads or writes KV before execution at commit.
 
-```http
-HTTP/1.1 200 OK
-X-KV-Version: <uint64>
-```
-
-The response body is empty. Existing keys are overwritten.
-
-### Get
-
-```http
-GET /v1/kv/{key}
-APIKey: <API_KEY>
-```
-
-Success:
-
-```http
-HTTP/1.1 200 OK
-Content-Type: <stored-content-type>
-X-KV-Version: <uint64>
-X-KV-Size: <bytes>
-X-KV-Checksum: <checksum>
-
-<raw value bytes>
-```
-
-Not found:
+The fragment above can return this status (with the actual deadline):
 
 ```json
-{"error":"KEY_NOT_FOUND","message":"key not found","request_id":"..."}
+{
+  "tx_id":"client-operation-42",
+  "status":"pending",
+  "total_ops":2,
+  "deadline":"2026-11-25T13:00:30Z",
+  "received_seq":[1],
+  "missing_seq":[2]
+}
 ```
 
-### Head
+Commit can arrive before the fragments. Missing fragments remain pending until the deadline; the final fragment then executes the transaction automatically. Always inspect the response `status`; a final fragment's 202 can contain a committed result.
 
-```http
-HEAD /v1/kv/{key}
-APIKey: <API_KEY>
+Commit body is `{ "total_ops": 2 }`, `{}`, or empty. A supplied nonzero total must match creation. JSON control bodies (create, commit, create-userspace) have a fixed 1 MiB limit and must contain one JSON object. Null, arrays, trailing content, or malformed JSON return 400; oversize bodies return 413. Unknown JSON fields are ignored.
+
+Operations run in seq order in one native storage transaction; internal reads see earlier writes. GET values in results use `value_base64`. A successful result has this shape:
+
+```json
+{"tx_id":"client-operation-42","status":"committed","results":[
+  {"seq":1,"op":"PUT","status":200,"key":"agents/session/42","version":1},
+  {"seq":2,"op":"GET","status":200,"key":"agents/session/42","content_type":"application/json","value_base64":"eyJzdGF0ZSI6InJlYWR5In0=","version":1}
+]}
 ```
 
-Same metadata headers as `GET`, no body.
+Missing GET/HEAD/DELETE keys abort and roll back the entire transaction. The HTTP response is 409 with an aborted `TxResult`, rather than the ordinary error envelope. EXISTS instead returns a per-operation 404 for an absent key and allows the transaction to continue. EXISTS is not an absence assertion and cannot enforce uniqueness.
 
-### Delete
+Serializable execution does not protect an application read/compute/write sequence across separate requests. Unique indexes, increments, and list read-modify-write operations require an application coordinator covering all writers, or a separately designed conditional-write extension. Atomic writes of base and index records alone do not enforce uniqueness.
 
-```http
-DELETE /v1/kv/{key}
-APIKey: <API_KEY>
+Identical fragment retries compare op ID, op type, decoded key, Content-Type, and body hash. They return 202, including original committed results. Conflicting pending fragments abort with `409 SEQ_CONFLICT`; committed transactions keep their result and return `409 TX_ALREADY_COMMITTED` for changed fragments. Aborted/expired transactions reject fragments. Repeated commit returns the identical committed result; repeated abort of an aborted transaction returns 200, while aborting an expired transaction returns 410.
+
+An optional `tx_digest` is `sha256:<lowercase hex>` over seq-sorted UTF-8 lines:
+
+```text
+<seq>\0<op_id>\0<op_type>\0<decoded-key>\0<body_hash>\n
 ```
 
-Success:
+Here `\0` is a NUL byte, `\n` a newline, and body_hash is `sha256:<lowercase hex>` of raw body bytes (empty bytes for no-body operations). This compatibility digest does not include Content-Type and is not a signature of all metadata. A waiting commit's non-empty digest cannot be cleared by an empty retry or replaced with a different non-empty digest.
 
-```http
-HTTP/1.1 204 No Content
-```
-
-Deleting a missing key returns `404 KEY_NOT_FOUND`.
-
-### Application Userspace URL API
-
-Third-party applications should use the userspace URL API. `{userspace}` must be the application name assigned by the administrator:
-
-```http
-PUT /api/v1/{userspace}/{key}
-GET /api/v1/{userspace}/{key}
-HEAD /api/v1/{userspace}/{key}
-DELETE /api/v1/{userspace}/{key}
-APIKey: <API_KEY>
-```
-
-For example, an application named `webapp` stores its `profile` key at:
-
-```http
-PUT /api/v1/webapp/profile
-APIKey: <WEBAPP_API_KEY>
-Content-Type: application/json
-
-{"enabled":true}
-```
-
-The server rejects mismatches between `{userspace}` and the authenticated principal with `403 FORBIDDEN`.
+Each value defaults to a 100 MiB cap. One transaction's accumulated fragment bodies default to a 256 MiB cap; rejected fragments do not persist and identical retries do not consume additional capacity. After a terminal state, fragment bodies are pruned after the configured retention period (default one hour), but identities, hashes, and full results remain for retries. Pruning does not guarantee that the database file shrinks. There is no global active-transaction-count limit.
 
 ## Admin Userspaces
 
-Only principals with the `admin` role may manage userspaces and their KV data.
-
-```http
-POST /v1/admin/userspaces
-APIKey: <ADMIN_API_KEY>
-Content-Type: application/json
-
-{"userspace_id":"webapp","user_id":"webapp"}
-```
-
-Success:
-
-```json
-{"user_id":"webapp","userspace_id":"webapp","api_key":"..."}
-```
-
-The generated `api_key` is plaintext and returned only in this response. The server stores only its HMAC-SHA256 digest. Re-creating an existing userspace returns `409 USERSPACE_EXISTS`.
-
-Management endpoints:
-
-```http
-GET    /v1/admin/userspaces
-DELETE /v1/admin/userspaces/{userspace}
-POST   /v1/admin/userspaces/{userspace}/api-key
-GET    /v1/admin/userspaces/{userspace}/keys
-PUT    /v1/admin/userspaces/{userspace}/kv/{key}
-GET    /v1/admin/userspaces/{userspace}/kv/{key}
-HEAD   /v1/admin/userspaces/{userspace}/kv/{key}
-DELETE /v1/admin/userspaces/{userspace}/kv/{key}
-APIKey: <ADMIN_API_KEY>
-```
-
-`POST /v1/admin/userspaces/{userspace}/api-key` replaces that userspace's APIKey and returns the new plaintext key once. Admin KV operations are for granular operational management and still pass through the global serializable lock.
-
-## Multi-Request Transactions
-
-Use transaction APIs when multiple KV operations must commit atomically and serializably. Transaction fragments are only recorded before commit; they are not executed and are not visible until commit succeeds.
-
-Flow:
-
-1. `POST /v1/tx` creates a transaction with fixed `total_ops`.
-2. `POST /v1/tx/{tx_id}/ops/{seq}` records each operation fragment. `seq` is 1-based.
-3. `POST /v1/tx/{tx_id}/commit` commits once all fragments are present.
-4. `GET /v1/tx/{tx_id}/result` reads committed result or current status.
-
-### Create Transaction
-
-```http
-POST /v1/tx
-Authorization: ApiKey <API_KEY>
-Content-Type: application/json
-
-{
-  "tx_id": "optional-client-id",
-  "total_ops": 3,
-  "timeout_ms": 30000
-}
-```
-
-`tx_id` may be omitted; generated IDs look like `tx_<hex>`. If supplied, it must match `[A-Za-z0-9_.:-]{1,128}`.
-
-Success:
-
-```json
-{
-  "tx_id": "tx_...",
-  "status": "pending",
-  "total_ops": 3,
-  "deadline": "2026-05-07T05:00:00Z"
-}
-```
-
-### Add Operation
-
-```http
-POST /v1/tx/{tx_id}/ops/{seq}
-Authorization: ApiKey <API_KEY>
-X-KV-Op: PUT
-X-KV-Key: profile
-X-KV-Op-Id: op-put-profile
-Content-Type: application/json
-
-{"name":"agent"}
-```
-
-Operation headers:
-
-- `X-KV-Op`: one of `GET`, `PUT`, `DELETE`, `EXISTS`, `HEAD`
-- `X-KV-Key`: URL-encoded or raw key string; use URL encoding for ambiguous characters
-- `X-KV-Op-Id`: stable client operation ID, required
-- `Content-Type`: required only to preserve value type for `PUT`
-
-`PUT` must include a non-empty body. `GET`, `DELETE`, `EXISTS`, and `HEAD` must not include a body.
-
-Success before commit:
-
-```json
-{
-  "tx_id": "tx_...",
-  "status": "pending",
-  "total_ops": 3,
-  "received_seq": [1],
-  "missing_seq": [2,3]
-}
-```
-
-Re-sending the same `tx_id` + `seq` with identical `X-KV-Op-Id`, op type, key, content type, and body hash is idempotent. Re-sending the same `seq` with different content aborts the transaction and returns `409 SEQ_CONFLICT`.
-
-### Commit
-
-```http
-POST /v1/tx/{tx_id}/commit
-Authorization: ApiKey <API_KEY>
-Content-Type: application/json
-
-{"total_ops":3}
-```
-
-If all fragments are present, the response is a committed result:
-
-```json
-{
-  "tx_id": "tx_...",
-  "status": "committed",
-  "results": [
-    {"seq":1,"op":"PUT","status":200,"key":"profile","version":1},
-    {"seq":2,"op":"GET","status":200,"key":"profile","content_type":"application/json","value_base64":"eyJuYW1lIjoiYWdlbnQifQ==","version":1},
-    {"seq":3,"op":"DELETE","status":204,"key":"profile","version":2}
-  ]
-}
-```
-
-Transaction `GET` result values are Base64 in `value_base64`; decode them before use.
-
-If commit arrives before all fragments:
-
-```json
-{
-  "tx_id": "tx_...",
-  "status": "waiting_for_ops",
-  "total_ops": 3,
-  "received_seq": [1],
-  "missing_seq": [2,3]
-}
-```
-
-After the missing fragments arrive, the server may commit during the final add-op call. Check that response for `status: "committed"` or call the result endpoint.
-
-Optional integrity check: commit body may include `tx_digest`. The digest format is `sha256:<hex>` over operation lines sorted by `seq`:
+All these endpoints require the `admin` role:
 
 ```text
-<seq>\0<op_id>\0<op_type>\0<key>\0<body_hash>\n
+POST   /v1/admin/userspaces
+GET    /v1/admin/userspaces
+DELETE /v1/admin/userspaces/{userspace_id}
+POST   /v1/admin/userspaces/{userspace_id}/api-key
+GET    /v1/admin/userspaces/{userspace_id}/keys
+PUT    /v1/admin/userspaces/{userspace_id}/kv/{encoded-key}
+GET    /v1/admin/userspaces/{userspace_id}/kv/{encoded-key}
+HEAD   /v1/admin/userspaces/{userspace_id}/kv/{encoded-key}
+DELETE /v1/admin/userspaces/{userspace_id}/kv/{encoded-key}
 ```
 
-`body_hash` is `sha256:<hex>` of the raw request body; for no-body ops it is the SHA-256 of empty bytes.
+Creation accepts `{"userspace_id":"webapp","user_id":"webapp"}`; user_id defaults to userspace_id. It returns 201 with `user_id`, `userspace_id`, and the new plaintext `api_key` once. Duplicate userspaces return 409. Listing keys returns sorted metadata without values, not a normal-user scan API.
 
-### Result
+Rotation returns the new plaintext APIKey once, invalidates all old APIKeys for that userspace, and preserves roles. Deletion atomically removes that userspace's KV, credentials, JWT mappings, and transactions. The bootstrap credential is created only during initial initialization; restart does not restore revoked credentials or deleted userspaces. Changing the configured bootstrap key is not a rotation mechanism.
 
-```http
-GET /v1/tx/{tx_id}/result
-Authorization: ApiKey <API_KEY>
-```
+## Import, Export, and Backup
 
-Returns either status metadata or a committed/aborted `TxResult`.
+`GET /v1/export` returns `application/octet-stream` with attachment filename `kv-export.bin`. The format starts with `KVHTTP01` and includes checksums. It contains only the current credential's KV records, with no credentials or transaction state.
 
-### Abort
+`POST /v1/import` takes that binary body with `Content-Type: application/octet-stream` and an optional `X-KV-Import-Mode`:
 
-```http
-POST /v1/tx/{tx_id}/abort
-Authorization: ApiKey <API_KEY>
-```
+| Mode | Behavior |
+|---|---|
+| `replace` (default) | Clear current userspace's KV, then import |
+| `merge-overwrite` | Replace conflicting values |
+| `merge-skip` | Preserve conflicting existing values |
 
-Success:
+Success returns 200 and `{"imported":10,"skipped":0,"replaced":0}`. Actual writes receive new global versions and updated_at timestamps; created_at is preserved when nonzero. Import does not restore the original version counter. Invalid format/checksums/duplicate keys return 400, and invalid JSON values return 422 before any KV changes.
 
-```json
-{"tx_id":"tx_...","status":"aborted"}
-```
+`KVHTTP_MAX_IMPORT_SIZE` limits the whole import body (default 1 GiB, including format overhead); `KVHTTP_MAX_VALUE_SIZE` still limits every value. Import/export buffer the complete dataset in memory. Export has no total-size limit, so a large export may require a higher import limit to restore.
 
-## Export and Import
+For a full backup, stop the service and copy `httpkvdb.db`. Before upgrading a legacy database, back up the entire stopped data directory. The legacy JSON is the migration input; old value mirrors are never used for recovery. Both become stale after migration; do not use them to undo later writes. Back up before a destructive import; an export taken after migration only archives the migrated state.
 
-Export/import operate on the authenticated credential's userspace only.
+## Error Handling and Retries
 
-### Export
+Ordinary application errors use `{"error":"CODE","message":"...","request_id":"..."}`. Transaction operation failures use the aborted result described above. HEAD never includes a body. Network/proxy failures can have other shapes, so clients should not assume every response is JSON.
 
-```http
-GET /v1/export
-Authorization: ApiKey <API_KEY>
-```
+| HTTP | Codes / meaning |
+|---|---|
+| 400 | BAD_REQUEST, INVALID_KEY, INVALID_USERSPACE, INVALID_TX |
+| 401 | UNAUTHORIZED |
+| 403 | FORBIDDEN: userspace, role, or transaction ownership mismatch |
+| 404 | KEY_NOT_FOUND, TX_NOT_FOUND, USERSPACE_NOT_FOUND, NOT_FOUND (unknown route/method combination) |
+| 405 | METHOD_NOT_ALLOWED (ordinary/admin KV) |
+| 409 | USERSPACE_EXISTS, SEQ_CONFLICT, TX_ALREADY_COMMITTED, TX_ABORTED; or an aborted TxResult |
+| 410 | TX_EXPIRED |
+| 413 | VALUE_TOO_LARGE: request or accumulated transaction body exceeds its limit |
+| 422 | INVALID_JSON |
+| 500 / 503 | STORAGE_ERROR (503 for failed readiness) |
 
-Success:
-
-```http
-HTTP/1.1 200 OK
-Content-Type: application/octet-stream
-Content-Disposition: attachment; filename="kv-export.bin"
-
-<binary export payload>
-```
-
-The binary format is HTTPKVDB-specific. Treat it as opaque unless implementing a format-compatible importer.
-
-### Import
-
-```http
-POST /v1/import
-Authorization: ApiKey <API_KEY>
-Content-Type: application/octet-stream
-X-KV-Import-Mode: replace
-
-<binary export payload>
-```
-
-Import modes:
-
-- `replace`: clear current userspace, then import records
-- `merge-overwrite`: merge and overwrite conflicting keys
-- `merge-skip`: merge and keep existing conflicting keys
-
-If `X-KV-Import-Mode` is omitted, mode is `replace`.
-
-Success:
-
-```json
-{"imported":10,"skipped":0,"replaced":0}
-```
-
-## Error Contract
-
-Errors are JSON:
-
-```json
-{
-  "error": "KEY_NOT_FOUND",
-  "message": "key not found",
-  "request_id": "..."
-}
-```
-
-Common status/error pairs:
-
-- `400 BAD_REQUEST`: malformed request
-- `400 INVALID_KEY`: invalid key
-- `400 INVALID_USERSPACE`: invalid userspace identifier
-- `400 INVALID_TX`: invalid transaction parameter or operation
-- `401 UNAUTHORIZED`: missing/invalid credential
-- `403 FORBIDDEN`: transaction belongs to another principal
-- `404 KEY_NOT_FOUND`: key missing
-- `404 TX_NOT_FOUND`: transaction missing
-- `409 SEQ_CONFLICT`: same transaction sequence received different content
-- `409 USERSPACE_EXISTS`: userspace already exists
-- `409 TX_ALREADY_COMMITTED`: transaction already committed
-- `409 TX_ABORTED`: transaction aborted
-- `410 TX_EXPIRED`: transaction deadline passed
-- `413 VALUE_TOO_LARGE`: body exceeds server limit
-- `422 INVALID_JSON`: `application/json` body is not valid JSON
-- `500 STORAGE_ERROR`: storage failure
-
-## Minimal Agent Client Algorithm
-
-Given `(BASE_URL, APP_NAME, API_KEY)`:
-
-1. Normalize `BASE_URL` by removing trailing `/`.
-2. Treat `APP_NAME` as the userspace.
-3. For authenticated calls, set `APIKey: ${API_KEY}`.
-4. Encode keys with path-segment percent encoding.
-5. Use `/api/v1/${APP_NAME}/${encodedKey}` for ordinary KV operations.
-6. Use transactions only when the action requires atomic multi-step read/write/delete semantics; transaction APIs still bind to the APIKey's userspace server-side.
-7. On `401`, stop and ask for a valid credential.
-8. On `403`, verify that `APP_NAME` exactly matches the userspace created by the administrator for this APIKey.
-9. On `404 KEY_NOT_FOUND`, treat as absent key, not transport failure.
-10. On `409` or `410` for transactions, create a new transaction unless the task requires preserving the original transaction ID.
-11. Never include secrets or raw values in logs, trace summaries, error reports, or prompts unless explicitly authorized.
-
-## Curl Smoke Test
-
-```sh
-BASE_URL="https://kvdb-api.example.com"
-API_KEY="provided-by-human"
-APP_NAME="webapp"
-KEY="$(python3 -c 'import urllib.parse; print(urllib.parse.quote("agent/smoke", safe=""))')"
-
-curl -fsS -X PUT "$BASE_URL/api/v1/$APP_NAME/$KEY" \
-  -H "APIKey: $API_KEY" \
-  -H "Content-Type: application/json" \
-  --data '{"ok":true}'
-
-curl -fsS "$BASE_URL/api/v1/$APP_NAME/$KEY" \
-  -H "APIKey: $API_KEY"
-```
+When a commit response is lost, query the original tx_id or repeat the same commit; do not immediately create a new transaction and repeat a business action. Only retry a confirmed aborted/expired operation in a new transaction after revalidating application state and business idempotency. On 401 obtain valid credentials; on 403 verify the assigned userspace, role, and ownership rather than changing paths to bypass checks.

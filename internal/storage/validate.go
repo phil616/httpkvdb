@@ -11,8 +11,9 @@ import (
 )
 
 var (
-	ErrInvalidKey  = errors.New("invalid key")
-	ErrInvalidJSON = errors.New("invalid json")
+	ErrInvalidKey         = errors.New("invalid key")
+	ErrInvalidJSON        = errors.New("invalid json")
+	ErrInvalidContentType = errors.New("invalid content type")
 )
 
 var userspaceIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
@@ -43,6 +44,16 @@ func ValueType(contentType string) string {
 	default:
 		return "binary"
 	}
+}
+
+// MaxContentTypeSize is bounded by the binary export format's uint16 length.
+const MaxContentTypeSize = 65535
+
+func ValidateContentType(contentType string) error {
+	if len(contentType) > MaxContentTypeSize || strings.ContainsAny(contentType, "\r\n\x00") {
+		return ErrInvalidContentType
+	}
+	return nil
 }
 
 func ValidateValue(contentType string, body []byte) error {

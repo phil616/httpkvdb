@@ -25,6 +25,8 @@ src/lib/                 API client, persistence, shared types
 
 Feature panels are lazy-loaded and Vite splits React, Ant Design, and application chunks during production builds.
 
+For source development/builds, use Node.js 24.x and npm 11.x as declared in package.json (packageManager pins the preferred npm version). Release archives contain the built web/dist assets, not the source or npm project; deploy those assets directly.
+
 ## Configure
 
 ```bash
@@ -45,11 +47,27 @@ KVHTTP_CORS_ALLOWED_ORIGINS=http://127.0.0.1:5173,http://localhost:5173
 
 APIKey sessions send the `APIKey` HTTP header. JWT sessions send `Authorization: Bearer <jwt>`.
 
+The backend does not serve the production bundle; host web/dist separately with
+a static server and configure VITE_API_BASE_URL at build time. Credentials remain
+in memory by default; selecting the remember option stores them in browser
+localStorage until cleared. Avoid that option on shared browsers.
+
+Transaction X-KV-Key headers and ordinary URL keys use one percent-encoding pass.
+The backend has no conditional write API: EXISTS does not enforce uniqueness.
+See [GUIDE.md](../GUIDE.md) for transaction errors, retries, and import limits.
+
 ## Develop
 
 ```bash
-npm install
+npm ci
 npm run dev
+```
+
+## Test
+
+```bash
+npm test
+npm run lint
 ```
 
 ## Build
